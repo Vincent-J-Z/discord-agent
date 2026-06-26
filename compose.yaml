@@ -1,0 +1,32 @@
+services:
+  discord-agent:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: discord-agent:local
+    working_dir: /app
+    user: "${HOST_UID:-agent}:${HOST_GID:-agent}"
+    init: true
+    restart: unless-stopped
+    # Root FS stays read-only; the source bind mount below is writable so the
+    # agent can edit its own code, and /workspace holds runtime state.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 1
+    mem_limit: 512m
+    environment:
+      DISCORD_AGENT_WORKSPACE: /workspace
+      HOME: /home/agent
+      # Run Claude in the mounted source tree so code edits land on the host.
+      CLAUDE_CWD: /app
+    volumes:
+      # Source code, mounted from the host so the agent can modify it and the
+      # changes persist on the local machine (host is the source of truth).
+      - ${DISCORD_AGENT_SOURCE_HOST:-.}:/app
+      - ${DISCORD_AGENT_WORKSPACE_HOST:-${HOME}/discordAgentWorkspace}:/workspace
+    command: ["python", "discord_agent_runtime.py"]

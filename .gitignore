@@ -1,0 +1,26 @@
+# Secrets & local config — NEVER commit
+.env
+secrets.env
+*.pem
+*_key
+id_*
+!*.pub
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime state (normally lives in the workspace, but ignore if it lands here)
+.discord_seen
+.claude_bridge_seen
+.bridge_cursors.json
+.discord_voice_on
+.status_msg_id
+.status.md
+.handled/
+.speak_queue/
+*.log
+
+# OS
+.DS_Store

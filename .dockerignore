@@ -1,0 +1,10 @@
+.env
+.discord_seen
+.status_msg_id
+.discord_voice_on
+.speak_queue/
+__pycache__/
+.venv/
+*.pyc
+*.pyo
+.DS_Store
