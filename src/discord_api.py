@@ -21,6 +21,7 @@ a thread is just a channel to the API.
 import argparse
 import json
 import os
+import re
 import sys
 from urllib.parse import quote
 
@@ -79,9 +80,13 @@ def read(a):
 
 
 def _send(channel, content, reply=None, mentions=None):
+    # Whitelist both explicitly-passed --mention ids AND any <@id> already in the
+    # text, so a mention written inline actually pings (Discord drops mentions
+    # not in allowed_mentions). Empty list => nothing pings.
+    ids = set(mentions or []) | set(re.findall(r"<@!?(\d+)>", content))
     payload = {
         "content": content[:2000],
-        "allowed_mentions": {"users": list(mentions or [])},
+        "allowed_mentions": {"users": sorted(ids)},
     }
     if reply:
         payload["message_reference"] = {"message_id": reply}

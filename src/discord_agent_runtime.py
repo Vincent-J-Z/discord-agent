@@ -18,6 +18,39 @@ load_dotenv(os.path.join(ROOT, ".env"))
 load_dotenv(os.path.join(WORKSPACE, ".env"), override=True)
 
 TICK_SECONDS = int(os.environ.get("TICK_SECONDS", "60"))
+# Proactive hourly sweep (0 disables). Persisted so restarts don't reset the clock.
+SWEEP_INTERVAL = int(os.environ.get("SWEEP_INTERVAL_SECONDS", "3600"))
+LAST_SWEEP_FILE = os.path.join(WORKSPACE, ".last_sweep")
+LIMITED_FILE = os.path.join(WORKSPACE, ".limited_until")
+DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred")
+
+
+def _resume_due():
+    """True when the rate limit has reset and there are queued requests to answer."""
+    try:
+        if not any(n.endswith(".json") for n in os.listdir(DEFERRED_DIR)):
+            return False
+    except FileNotFoundError:
+        return False
+    try:
+        with open(LIMITED_FILE) as f:
+            until = float(f.read().strip())
+    except Exception:
+        until = 0.0
+    return time.time() >= until
+
+
+def _last_sweep():
+    try:
+        with open(LAST_SWEEP_FILE) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
+
+
+def _mark_sweep():
+    with open(LAST_SWEEP_FILE, "w") as f:
+        f.write(str(time.time()))
 
 
 def setup_ssh():
@@ -58,11 +91,25 @@ def main():
     # Supervised separately and respawned if it dies; its absence must never
     # take the bridge down.
     gateway = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_gateway.py")])
+    if SWEEP_INTERVAL > 0 and _last_sweep() == 0.0:
+        _mark_sweep()  # don't sweep the instant we boot; first sweep one interval later
+    sweep = None
+    resume = None
     try:
         while bridge.poll() is None:
             if gateway.poll() is not None:
                 print("[runtime] gateway exited; respawning", flush=True)
                 gateway = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_gateway.py")])
+            # Auto-resume: when the rate limit clears, answer the deferred queue.
+            if (resume is None or resume.poll() is not None) and _resume_due():
+                print("[runtime] rate limit cleared — draining deferred queue", flush=True)
+                resume = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_resume.py")])
+            # Hourly proactive sweep — only if the previous one has finished.
+            if SWEEP_INTERVAL > 0 and (sweep is None or sweep.poll() is not None):
+                if time.time() - _last_sweep() >= SWEEP_INTERVAL:
+                    _mark_sweep()
+                    print("[runtime] launching proactive sweep", flush=True)
+                    sweep = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_sweep.py")])
             status_body = os.path.join(WORKSPACE, ".status.md")
             if os.path.exists(status_body):
                 subprocess.run([sys.executable, os.path.join(ROOT, "discord_status.py")], check=False)

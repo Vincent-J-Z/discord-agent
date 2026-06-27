@@ -18,7 +18,8 @@ back from Discord or from files.
   apt/global installs are **per-container (ephemeral)** — fine for a task. If a
   tool should be permanent, add it to `/app/Containerfile` (your code, editable)
   and tell the operator to rebuild via `/app/run-container.sh`.
-- Your own source is `/app` (your cwd) and hot-reloads when you edit it.
+- Your own source is in `/app/src/` (your cwd is `/app`, the mounted repo) and
+  hot-reloads when you edit it.
 - Runtime state + config live in `/workspace`. Use `$TMPDIR` (`/workspace/tmp`,
   disk-backed) for big downloads/transcodes — `/tmp` is small RAM-backed tmpfs.
 - For a cloned project (e.g. `/workspace/beta`), create a venv there and
@@ -44,21 +45,21 @@ You can read and act across the whole guild via the Discord REST API
 If someone asks about another channel/thread, **go fetch it — never say you
 can't see it.**
 
-## Toolbox — `/app/discord_api.py`
+## Toolbox — `/app/src/discord_api.py`
 Prefer this over hand-writing API calls (channel ids and thread ids are
 interchangeable — a thread is just a channel):
 
 ```
-python /app/discord_api.py whoami
-python /app/discord_api.py channels                       # text channels
-python /app/discord_api.py threads                        # active threads (forum posts)
-python /app/discord_api.py read   <channel_id> [--limit 30]
-python /app/discord_api.py post   <channel_id> "text" [--reply <msg_id>] [--mention <uid>]
-python /app/discord_api.py reply  <channel_id> <msg_id> "text"
-python /app/discord_api.py react  <channel_id> <msg_id> ✅
-python /app/discord_api.py edit   <channel_id> <msg_id> "new text"
-python /app/discord_api.py pin    <channel_id> <msg_id>
-python /app/discord_api.py forum-post <forum_id> "title" "first message"
+python /app/src/discord_api.py whoami
+python /app/src/discord_api.py channels                       # text channels
+python /app/src/discord_api.py threads                        # active threads (forum posts)
+python /app/src/discord_api.py read   <channel_id> [--limit 30]
+python /app/src/discord_api.py post   <channel_id> "text" [--reply <msg_id>] [--mention <uid>]
+python /app/src/discord_api.py reply  <channel_id> <msg_id> "text"
+python /app/src/discord_api.py react  <channel_id> <msg_id> ✅
+python /app/src/discord_api.py edit   <channel_id> <msg_id> "new text"
+python /app/src/discord_api.py pin    <channel_id> <msg_id>
+python /app/src/discord_api.py forum-post <forum_id> "title" "first message"
 ```
 
 ## Guild map (verify with `channels` / `threads`, don't trust this blindly)
@@ -68,17 +69,44 @@ python /app/discord_api.py forum-post <forum_id> "title" "first message"
 - Other channels are normal text: `general`, `alpha`, `曲曲agent`, `moe`,
   `main-agent`, `mochi_chatbot_maintenance`.
 
-## Long-running tasks (avoid the wall-clock timeout)
-Each @ runs as one synchronous `claude -p` with a ~30-min cap. So:
-- For anything that may take a while, **post progress to the channel as you go**
-  (`discord_api.py post`/`reply`) — the user sees movement, and if you do hit the
-  cap, the work so far isn't invisible.
-- For jobs that can run **much longer than 30 min** (full pipeline sweeps, large
-  downloads/transcodes, long `ssh fin-agent` runs): **don't block** — launch them
-  detached (`nohup … >/workspace/logs/<job>.log 2>&1 &` or `tmux`/`setsid`),
-  reply "started, will report when done", and post the result in a later message
-  (you can check the log on your next invocation). Persist anything important to
-  `/workspace` so a fresh run can pick it up.
+## Progress reporting — DON'T go silent
+The bridge only posts your FINAL answer, and while you work the channel shows
+only a "typing…" indicator — to the user a long silent run looks like you died.
+So for anything beyond a quick reply, **narrate as you go** by posting to THIS
+channel yourself (the channel id is given in every message):
+
+    python /app/src/discord_api.py post <channel_id> "🔧 <what you're doing now>"
+
+- Post a short kickoff the moment you start real work (e.g. "on it — cloning the
+  repo and reading the download path first").
+- Post a one-line update at each meaningful milestone (cloned → found root cause
+  → patch written → running tests). Don't narrate every command; aim for a
+  heartbeat roughly every 30–60s of work.
+- The bridge still posts your final result at the end, so finish with the outcome.
+
+## Very long jobs (> ~30 min) — background them as sub-agents
+Each @ runs as one `claude -p` with a ~30-min cap. For jobs longer than that
+(full pipeline sweeps, large downloads/transcodes, long `ssh fin-agent` runs), to
+fan work out, or to drive an interactive process: **don't block** — spawn a
+**sub-agent** in tmux and report later. Use the `subagents` skill / its CLI:
+
+    python /app/src/subagent.py spawn  <name> "<cmd>" --channel <id> --report
+    python /app/src/subagent.py claude <name> "<prompt>" --channel <id> --report
+    python /app/src/subagent.py list | logs <name> | send <name> "<keys>" | kill | reap
+
+It tracks each job's state under `/workspace/subagents/` (survives restarts), so
+a later invocation can `list`/`logs` to see what a prior run launched and collect
+results. Post "started, will report when done" and end your turn; with `--report`
+the job posts its own completion. (Raw `nohup`/`setsid` still work for trivial
+fire-and-forget, but prefer the sub-agent CLI so the job is trackable.)
+
+## Heavy compute → run it on fin-agent, not in this container
+This container is a lightweight coordinator (~6 GB cap). Memory-heavy work —
+**whisper transcription, ffmpeg transcode of large media, `pip install torch` &
+friends, full pipeline runs** — should run on **fin-agent** via `ssh fin-agent
+"…"` (the always-on box with real resources), not locally where it can OOM. If
+you must do something heavy locally, keep big scratch under `/workspace/tmp`
+(disk-backed) and prefer a tracked sub-agent over a foreground run.
 
 ## Conventions
 - Reply concisely, plain text, in the sender's language.

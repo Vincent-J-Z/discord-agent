@@ -20,6 +20,7 @@ import concurrent.futures
 import json
 import os
 import sys
+import threading
 
 import websockets
 from dotenv import load_dotenv
@@ -41,6 +42,17 @@ ACTIVITY_TYPE = int(os.environ.get("BOT_ACTIVITY_TYPE", "3"))
 INTENTS = int(os.environ.get("GATEWAY_INTENTS", str(1 << 9)))
 WORKERS = int(os.environ.get("GATEWAY_WORKERS", "4"))
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
+
+# Hot-reload safety: a source edit must NOT kill a reply that's mid-flight (that
+# made the bot "go silent" right after editing its own code). We count active
+# handlers and, once a reload is pending, stop taking new work and wait for the
+# in-flight ones to finish posting before re-exec'ing. Bounded by a grace cap so
+# a stuck/very-long job can't block the reload forever (those should be
+# backgrounded per CLAUDE.md anyway).
+_inflight = 0
+_inflight_lock = threading.Lock()
+_reloading = threading.Event()
+RELOAD_GRACE = int(os.environ.get("RELOAD_GRACE_SECONDS", "300"))
 
 SELF = os.path.abspath(__file__)
 WATCH = [SELF, os.path.join(ROOT, "discord_claude_bridge.py")]
@@ -74,10 +86,16 @@ def identify_payload():
 
 
 def _handle(channel_id, d):
+    global _inflight
+    with _inflight_lock:
+        _inflight += 1
     try:
         bridge.handle_message(channel_id, d)
     except Exception as exc:
         print(f"[gateway] handler error in {channel_id}: {exc}", flush=True)
+    finally:
+        with _inflight_lock:
+            _inflight -= 1
 
 
 def on_message_create(d):
@@ -88,6 +106,12 @@ def on_message_create(d):
         return
     channel_id = str(d.get("channel_id"))
     who = (d.get("author") or {}).get("username")
+    # A reload is pending and we're about to re-exec — don't start new work that
+    # we'd just have to kill. The REST poller picks it up after we come back
+    # (the message isn't claimed until a handler actually runs it).
+    if _reloading.is_set():
+        print(f"[gateway] @mention in {channel_id} from {who} — deferring (reload pending)", flush=True)
+        return
     print(f"[gateway] @mention in {channel_id} from {who} — dispatching", flush=True)
     POOL.submit(_handle, channel_id, d)
 
@@ -115,7 +139,25 @@ async def reload_watcher():
                 MT[f] = _mtime(f)
                 ok = False
         if ok:
-            print("[gateway] source changed — reloading (execv)", flush=True)
+            # Stop taking new work, then let in-flight replies finish posting
+            # before we replace the process image — otherwise execv kills their
+            # claude subprocesses and the bot "goes silent" right after an edit.
+            _reloading.set()
+            waited = 0.0
+            while True:
+                with _inflight_lock:
+                    n = _inflight
+                if n == 0 or waited >= RELOAD_GRACE:
+                    break
+                if waited == 0.0:
+                    print(f"[gateway] source changed — draining {n} in-flight "
+                          f"handler(s) before reload (grace {RELOAD_GRACE}s)", flush=True)
+                await asyncio.sleep(0.5)
+                waited += 0.5
+            if n:
+                print(f"[gateway] grace expired — reloading with {n} handler(s) "
+                      "still running (their replies may be dropped)", flush=True)
+            print("[gateway] reloading (execv)", flush=True)
             POOL.shutdown(wait=False)
             os.execv(sys.executable, [sys.executable, SELF])
 

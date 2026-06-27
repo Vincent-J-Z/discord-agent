@@ -29,4 +29,4 @@ services:
       # changes persist on the local machine (host is the source of truth).
       - ${DISCORD_AGENT_SOURCE_HOST:-.}:/app
       - ${DISCORD_AGENT_WORKSPACE_HOST:-${HOME}/discordAgentWorkspace}:/workspace
-    command: ["python", "discord_agent_runtime.py"]
+    command: ["python", "src/discord_agent_runtime.py"]

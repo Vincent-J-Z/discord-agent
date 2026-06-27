@@ -24,7 +24,7 @@ container stop discord-agent 2>/dev/null || true
 container rm discord-agent 2>/dev/null || container delete discord-agent 2>/dev/null || true
 
 container run -d --name discord-agent \
-  --cpus "${AGENT_CPUS:-4}" --memory "${AGENT_MEM:-4g}" \
+  --cpus "${AGENT_CPUS:-6}" --memory "${AGENT_MEM:-6g}" \
   --user agent \
   --workdir /app \
   -e DISCORD_AGENT_WORKSPACE=/workspace \

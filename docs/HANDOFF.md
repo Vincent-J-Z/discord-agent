@@ -101,8 +101,8 @@ The container image runs code from `/app` and mounts the workspace at
 
 ```bash
 mkdir -p "$HOME/discordAgentWorkspace"
-cp .env.example "$HOME/discordAgentWorkspace/.env"
-cp status.example.md "$HOME/discordAgentWorkspace/.status.md"
+cp examples/.env.example "$HOME/discordAgentWorkspace/.env"
+cp examples/status.example.md "$HOME/discordAgentWorkspace/.status.md"
 printf '0\n' > "$HOME/discordAgentWorkspace/.discord_seen"
 docker compose up -d --build
 ```

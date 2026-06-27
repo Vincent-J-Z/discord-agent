@@ -17,10 +17,13 @@ ARG CLAUDE_CODE_VERSION=latest
 #   libpq-dev + build-essential — so `pip install psycopg2` etc. work in a venv
 #   gh                — open/merge PRs
 #   curl, jq, unzip   — general scripting
+#   tmux              — long-lived sessions that outlive a single @-invocation;
+#                       used to spawn/maintain sub-agents (see subagent.py +
+#                       the `subagents` skill)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         nodejs npm ca-certificates git curl jq unzip sudo openssh-client \
-        ffmpeg postgresql-client libpq-dev build-essential \
+        ffmpeg postgresql-client libpq-dev build-essential tmux \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -50,18 +53,12 @@ RUN git config --system user.name "Mochi_Bot" \
     && git config --system user.email "mochi-bot@users.noreply.github.com" \
     && git config --system safe.directory '*'
 
-COPY --chown=agent:agent \
-    discord_agent_runtime.py \
-    discord_claude_bridge.py \
-    discord_gateway.py \
-    discord_poll.py \
-    discord_status.py \
-    post_message.py \
-    discord_api.py \
-    CLAUDE.md \
-    HANDOFF.md \
-    /app/
+# Python runtime lives in src/; CLAUDE.md stays at the repo root (claude's cwd).
+# (In the container deployment the host repo is bind-mounted over /app, so this
+# COPY is mainly for running the image standalone.)
+COPY --chown=agent:agent src/ /app/src/
+COPY --chown=agent:agent CLAUDE.md /app/
 
 USER agent
 
-CMD ["python", "discord_agent_runtime.py"]
+CMD ["python", "src/discord_agent_runtime.py"]

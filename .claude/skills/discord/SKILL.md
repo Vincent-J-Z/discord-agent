@@ -6,7 +6,7 @@ description: Read from and act on any Discord channel or thread in Mochi_Bot's g
 # Discord operations
 
 Mochi_Bot acts over the Discord REST API with its bot token (`$DISCORD_BOT_TOKEN`).
-All operations go through one CLI: **`/app/discord_api.py`**. Channel ids and
+All operations go through one CLI: **`/app/src/discord_api.py`**. Channel ids and
 thread ids are interchangeable (a thread is just a channel).
 
 ## Recipes
@@ -14,25 +14,25 @@ thread ids are interchangeable (a thread is just a channel).
 Find where something is, then act:
 
 ```bash
-python /app/discord_api.py channels          # text channels in the guild
-python /app/discord_api.py threads           # active threads incl. forum posts
-python /app/discord_api.py read <id> --limit 30
+python /app/src/discord_api.py channels          # text channels in the guild
+python /app/src/discord_api.py threads           # active threads incl. forum posts
+python /app/src/discord_api.py read <id> --limit 30
 ```
 
 Respond:
 
 ```bash
-python /app/discord_api.py reply <channel_id> <msg_id> "your reply"   # threaded reply
-python /app/discord_api.py post  <channel_id> "message" --mention <user_id>
-python /app/discord_api.py react <channel_id> <msg_id> ✅              # ack with emoji
-python /app/discord_api.py edit  <channel_id> <msg_id> "updated text"  # edit own msg
-python /app/discord_api.py pin   <channel_id> <msg_id>
+python /app/src/discord_api.py reply <channel_id> <msg_id> "your reply"   # threaded reply
+python /app/src/discord_api.py post  <channel_id> "message" --mention <user_id>
+python /app/src/discord_api.py react <channel_id> <msg_id> ✅              # ack with emoji
+python /app/src/discord_api.py edit  <channel_id> <msg_id> "updated text"  # edit own msg
+python /app/src/discord_api.py pin   <channel_id> <msg_id>
 ```
 
 Forums (e.g. `omega`) — a "new post" is a new thread:
 
 ```bash
-python /app/discord_api.py forum-post <forum_id> "Post title" "first message body"
+python /app/src/discord_api.py forum-post <forum_id> "Post title" "first message body"
 ```
 
 ## Notes

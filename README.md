@@ -15,22 +15,29 @@ network, and tool access — running headless inside a hardened container.
   and install what it needs (`sudo apt`).
 
 ## Layout
-| File | Role |
+```
+src/        Python runtime (bridge, gateway, sweep, toolbox, …)
+docs/       HANDOFF.md (setup), FEATURE-REPORT.md (roadmap)
+examples/   .env / secrets / compose templates
+CLAUDE.md   the bot's operating context (loaded by claude each run, cwd=/app)
+Containerfile · compose.yaml · run-container.sh · autostart.sh   build/run/boot
+```
+
+| `src/` file | Role |
 |------|------|
-| `discord_agent_runtime.py` | Supervisor: launches + watches the bridge, gateway, status board; materializes `~/.ssh`. |
-| `discord_claude_bridge.py` | REST poller + message handler (`claude -p`), hot-reload, dedup, history context. |
+| `discord_agent_runtime.py` | Supervisor: launches + watches the bridge, gateway, sweep, status board; materializes `~/.ssh`. |
+| `discord_claude_bridge.py` | REST poller + message handler (`claude -p`), hot-reload, sessions, dedup, rate-limit gate, chunking. |
 | `discord_gateway.py` | Gateway presence + real-time `@`-mention trigger → worker pool. |
-| `discord_api.py` | Discord toolbox CLI (read/post/reply/react/edit/pin/threads/forum-post). |
+| `discord_sweep.py` / `discord_resume.py` | Hourly proactive sweep · deferred-queue drainer after a rate limit. |
+| `discord_api.py` / `subagent.py` | Discord toolbox CLI · long-lived sub-agent (tmux) manager. |
 | `discord_poll.py` / `discord_status.py` / `post_message.py` | One-shot poll, live status board, REST post helper. |
-| `CLAUDE.md` | The bot's operating context, loaded by `claude` every run. |
-| `Containerfile` / `compose.yaml` / `run-container.sh` / `autostart.sh` | Build, run, and boot-persist the container. |
 
 ## Setup
-See [HANDOFF.md](HANDOFF.md) for full setup. In short:
+See [docs/HANDOFF.md](docs/HANDOFF.md) for full setup. In short:
 
 ```bash
-cp .env.example ~/discordAgentWorkspace/.env      # fill in token, ids, OAuth token
-cp secrets.env.example ~/discordAgentWorkspace/secrets.env   # optional task creds
+cp examples/.env.example ~/discordAgentWorkspace/.env      # fill in token, ids, OAuth token
+cp examples/secrets.env.example ~/discordAgentWorkspace/secrets.env   # optional task creds
 ./run-container.sh                                 # build is via Containerfile
 ```
 
