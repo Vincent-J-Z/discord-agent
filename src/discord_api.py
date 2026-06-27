@@ -35,7 +35,8 @@ load_dotenv(
 )
 
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
-GUILD = os.environ.get("DISCORD_GUILD_ID", "").strip()
+# Optional restriction (one id or comma-separated); blank → all joined guilds.
+GUILDS = [g.strip() for g in os.environ.get("DISCORD_GUILD_ID", "").split(",") if g.strip()]
 API = "https://discord.com/api/v10"
 H = {"Authorization": f"Bot {TOKEN}"}
 HJSON = {**H, "Content-Type": "application/json"}
@@ -49,25 +50,36 @@ def _req(method, path, **kw):
     return r
 
 
+def _guilds():
+    # During message handling the bridge sets MOCHI_CURRENT_GUILD so the toolbox
+    # is scoped to ONLY the current server (server isolation — never expose other
+    # servers' channels/threads here).
+    current = os.environ.get("MOCHI_CURRENT_GUILD", "").strip()
+    if current:
+        return [(current, None)]
+    if GUILDS:
+        return [(g, None) for g in GUILDS]
+    return [(str(g["id"]), g.get("name")) for g in _req("GET", "/users/@me/guilds", headers=H).json()]
+
+
 def whoami(_):
     me = _req("GET", "/users/@me", headers=H).json()
-    print(f"{me['username']} (id={me['id']}) guild={GUILD or '(unset)'}")
+    gs = ", ".join(f"{name or gid}" for gid, name in _guilds())
+    print(f"{me['username']} (id={me['id']}) guilds: {gs}")
 
 
 def channels(_):
-    if not GUILD:
-        raise SystemExit("DISCORD_GUILD_ID not set")
-    for c in _req("GET", f"/guilds/{GUILD}/channels", headers=H).json():
-        if c.get("type") in TEXT_TYPES:
-            print(f"{c['id']}  type={c['type']:<2} {c.get('name')}")
+    for gid, name in _guilds():
+        print(f"# guild {name or gid}")
+        for c in _req("GET", f"/guilds/{gid}/channels", headers=H).json():
+            if c.get("type") in TEXT_TYPES:
+                print(f"{c['id']}  type={c['type']:<2} {c.get('name')}")
 
 
 def threads(_):
-    if not GUILD:
-        raise SystemExit("DISCORD_GUILD_ID not set")
-    data = _req("GET", f"/guilds/{GUILD}/threads/active", headers=H).json()
-    for t in data.get("threads", []):
-        print(f"{t['id']}  parent={t.get('parent_id')}  {t.get('name')}")
+    for gid, name in _guilds():
+        for t in _req("GET", f"/guilds/{gid}/threads/active", headers=H).json().get("threads", []):
+            print(f"{t['id']}  parent={t.get('parent_id')}  {t.get('name')}")
 
 
 def read(a):

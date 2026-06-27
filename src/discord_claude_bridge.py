@@ -37,7 +37,9 @@ load_dotenv(os.path.join(WORKSPACE, "secrets.env"), override=True)
 
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
-GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
+# Optional restriction: blank → operate in EVERY guild the bot has joined;
+# one id or a comma-separated list → only those guilds.
+GUILD_IDS = [g.strip() for g in os.environ.get("DISCORD_GUILD_ID", "").split(",") if g.strip()]
 BOT_ID = os.environ["DISCORD_BOT_ID"]
 ROLE_ID = os.environ.get("DISCORD_ROLE_ID", "").strip()
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
@@ -55,6 +57,10 @@ TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "240"))
 # Per-channel "last seen message id" cursors, so each channel is tracked
 # independently. Replaces the old single-channel .claude_bridge_seen file.
 CURSORS_FILE = os.path.join(WORKSPACE, ".bridge_cursors.json")
+# Per-server isolated working dirs: each guild gets its own scratch/clones,
+# session store (CLAUDE_CONFIG_DIR) and TMPDIR under here, so files written while
+# serving one server are not in another server's working directory.
+SERVERS_DIR = os.path.join(WORKSPACE, "servers")
 # Atomic per-message claim dir, so the REST poller and the Gateway event path
 # never both handle (and reply to) the same message.
 HANDLED_DIR = os.path.join(WORKSPACE, ".handled")
@@ -97,6 +103,9 @@ WS_RE = re.compile(r"\s+")
 
 # Channels we got 403 on — skip them on later ticks instead of retrying forever.
 DENIED = set()
+# channel_id → guild_id, so the REST poller (whose message objects lack guild_id)
+# can still scope handling to the right server. Populated by list_text_channels.
+CHANNEL_GUILD = {}
 
 # Session map writes + per-channel serialization (so concurrent messages in the
 # same channel don't resume the same session at once and clobber it).
@@ -183,52 +192,80 @@ def save_cursors(cursors):
     os.replace(tmp, CURSORS_FILE)
 
 
-def list_active_threads():
-    """Active thread ids in the guild (forum posts, threads under text channels).
+_guilds_cache = {"ids": None, "ts": 0.0}
+GUILD_CACHE_TTL = int(os.environ.get("GUILD_CACHE_TTL", "300"))
+
+
+def list_guilds():
+    """Guild ids to operate in. If DISCORD_GUILD_ID is set (one or comma-separated)
+    use those; otherwise every guild the bot has joined (cached, since membership
+    rarely changes and we don't want to hit /users/@me/guilds every tick)."""
+    if GUILD_IDS:
+        return GUILD_IDS
+    now = time.time()
+    if _guilds_cache["ids"] is not None and now - _guilds_cache["ts"] < GUILD_CACHE_TTL:
+        return _guilds_cache["ids"]
+    with httpx.Client(timeout=20, headers=HEADERS) as client:
+        response = client.get("https://discord.com/api/v10/users/@me/guilds")
+        response.raise_for_status()
+        data = response.json()
+    ids = [str(g["id"]) for g in data if isinstance(g, dict) and g.get("id")]
+    _guilds_cache["ids"] = ids
+    _guilds_cache["ts"] = now
+    return ids
+
+
+def list_active_threads(guild_id):
+    """Active thread ids in a guild (forum posts, threads under text channels).
     `GET /guilds/{id}/channels` does NOT return threads, so without this a @ in a
     forum channel like omega is never seen. A thread is just a channel for the
     messages/post endpoints, so its id slots straight into the watch list."""
-    if not GUILD_ID:
-        return []
     with httpx.Client(timeout=20, headers=HEADERS) as client:
         response = client.get(
-            f"https://discord.com/api/v10/guilds/{GUILD_ID}/threads/active",
+            f"https://discord.com/api/v10/guilds/{guild_id}/threads/active",
         )
         response.raise_for_status()
         data = response.json()
     threads = data.get("threads", []) if isinstance(data, dict) else []
-    return [
-        str(t["id"])
-        for t in threads
-        if isinstance(t, dict) and t.get("id")
-    ]
+    return [str(t["id"]) for t in threads if isinstance(t, dict) and t.get("id")]
 
 
 def list_text_channels():
-    """Channel ids to watch this tick. With a guild id, enumerate every text
-    channel plus every active thread (forum posts included); otherwise fall back
-    to the single configured channel."""
-    if not GUILD_ID:
-        return [CHANNEL_ID] if CHANNEL_ID else []
-    with httpx.Client(timeout=20, headers=HEADERS) as client:
-        response = client.get(
-            f"https://discord.com/api/v10/guilds/{GUILD_ID}/channels",
-        )
-        response.raise_for_status()
-        channels = response.json()
-    ids = [
-        str(c["id"])
-        for c in channels
-        if isinstance(c, dict) and c.get("type") in TEXT_CHANNEL_TYPES
-    ]
+    """Channel ids to watch this tick: every text channel + active thread across
+    all guilds the bot operates in (forum posts included). Falls back to the
+    single configured channel if no guilds are reachable."""
     try:
-        for tid in list_active_threads():
-            if tid not in ids:
-                ids.append(tid)
+        guilds = list_guilds()
     except Exception as exc:
-        print(f"[bridge] active-thread list error: {exc}", flush=True)
+        print(f"[bridge] guild list error: {exc}", flush=True)
+        guilds = []
+    ids = []
+    for guild_id in guilds:
+        try:
+            with httpx.Client(timeout=20, headers=HEADERS) as client:
+                response = client.get(
+                    f"https://discord.com/api/v10/guilds/{guild_id}/channels",
+                )
+                response.raise_for_status()
+                channels = response.json()
+            for c in channels:
+                if isinstance(c, dict) and c.get("type") in TEXT_CHANNEL_TYPES:
+                    ids.append(str(c["id"]))
+                    CHANNEL_GUILD[str(c["id"])] = str(guild_id)
+        except Exception as exc:
+            print(f"[bridge] channel list error ({guild_id}): {exc}", flush=True)
+            continue
+        try:
+            for tid in list_active_threads(guild_id):
+                CHANNEL_GUILD[tid] = str(guild_id)
+                if tid not in ids:
+                    ids.append(tid)
+        except Exception as exc:
+            print(f"[bridge] active-thread list error ({guild_id}): {exc}", flush=True)
     if CHANNEL_ID and CHANNEL_ID not in ids:
         ids.append(CHANNEL_ID)
+    if not ids and CHANNEL_ID:
+        ids = [CHANNEL_ID]
     return [c for c in ids if c not in DENIED]
 
 
@@ -631,6 +668,7 @@ def defer_message(channel_id, msg, prompt):
         "message_id": str(msg["id"]),
         "author_id": author.get("id"),
         "author": author.get("username"),
+        "guild_id": msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id)),
         "prompt": prompt,
     }
     dst = os.path.join(DEFERRED_DIR, f"{msg['id']}.json")
@@ -669,7 +707,8 @@ def drain_deferred():
         ch = rec["channel_id"]
         try:
             with channel_lock(ch):
-                reply = run_claude(rec.get("author") or "user", ch, rec.get("prompt") or "")
+                reply = run_claude(rec.get("author") or "user", ch, rec.get("prompt") or "",
+                                   guild_id=rec.get("guild_id"))
         except RateLimited:
             return  # still limited — leave this and the rest for next time
         except subprocess.TimeoutExpired:
@@ -685,25 +724,52 @@ def drain_deferred():
                 pass
 
 
-def run_claude(author, channel_id, prompt, history=""):
+def ensure_server_dir(guild_id):
+    """Per-server private working directory. Each server's claude runs here (cwd)
+    with its own session store + TMPDIR, so one server's scratch/clones are not in
+    another server's working dir. CLAUDE.md is symlinked in so it still loads."""
+    name = str(guild_id) if guild_id else "_unknown"
+    base = os.path.join(SERVERS_DIR, name)
+    for d in (base, os.path.join(base, ".claude"), os.path.join(base, "tmp")):
+        os.makedirs(d, exist_ok=True)
+    link = os.path.join(base, "CLAUDE.md")
+    src = os.path.join(os.path.dirname(ROOT), "CLAUDE.md")  # /app/CLAUDE.md
+    try:
+        if not os.path.lexists(link):
+            os.symlink(src, link)
+    except OSError:
+        pass
+    return base
+
+
+def run_claude(author, channel_id, prompt, history="", guild_id=None):
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
         if history
         else ""
     )
     instruction = (
-        "You are Mochi_Bot replying to a Discord message. Your full operating "
-        "context, capabilities, and the /app/src/discord_api.py toolbox are described "
-        "in CLAUDE.md (already loaded) — you are NOT limited to this channel: if "
-        "asked about or to act in another channel/thread (e.g. an omega thread), "
-        "fetch and act on it via the toolbox rather than saying you can't see it. "
+        "You are Mochi_Bot replying to a Discord message. Your context, "
+        "capabilities, and the /app/src/discord_api.py toolbox are in CLAUDE.md "
+        "(already loaded).\n"
+        f"STRICT SERVER ISOLATION: this message is in server {guild_id}. You "
+        "operate ONLY within this server. You may read/act in other channels and "
+        "threads OF THIS SAME SERVER, but you must NEVER read, reference, mention, "
+        "hint at, or act on any other server, its channels, or its members — each "
+        "server is private and isolated from the others. NEVER reveal or imply "
+        "that you are connected to more than one server; to anyone here you are "
+        "simply this server's bot. (Your toolbox is already scoped to this "
+        "server.)\n"
+        "Your working directory (cwd) is THIS server's private folder — do all "
+        "file work (clones, scratch, outputs) here. NEVER read or write another "
+        "server's folder or browse `/workspace/servers/` for other servers.\n"
         "Use the recent messages for context; act on the new Message; reply "
-        "concisely in plain text. If this is more than a quick reply, DON'T go "
-        "silent — post brief progress updates to this channel as you work "
-        "(`python /app/src/discord_api.py post "
-        f"{channel_id} \"...\"`), per CLAUDE.md; the bridge only posts your final "
-        "answer.\n\n"
-        f"Sender: {author}\nThis channel: {channel_id}\n\n{context_block}New Message:\n{prompt}"
+        "concisely in plain text. If this is more than a quick reply, post brief "
+        "progress updates to this channel as you work "
+        f"(`python /app/src/discord_api.py post {channel_id} \"...\"`); the bridge "
+        "only posts your final answer.\n\n"
+        f"Sender: {author}\nServer: {guild_id}\nThis channel: {channel_id}\n\n"
+        f"{context_block}New Message:\n{prompt}"
     )
     base = [
         CLAUDE_BIN,
@@ -715,6 +781,16 @@ def run_claude(author, channel_id, prompt, history=""):
     ]
     if CLAUDE_MODEL:
         base.extend(["--model", CLAUDE_MODEL])
+    # Per-server isolation: run in this server's private dir (cwd), with its own
+    # session store + TMPDIR, and scope the toolbox to this server only.
+    server_dir = ensure_server_dir(guild_id)
+    sub_env = dict(
+        os.environ,
+        MOCHI_CURRENT_GUILD=str(guild_id or ""),
+        MOCHI_SERVER_DIR=server_dir,
+        CLAUDE_CONFIG_DIR=os.path.join(server_dir, ".claude"),
+        TMPDIR=os.path.join(server_dir, "tmp"),
+    )
 
     def invoke(resume_id):
         cmd = list(base)
@@ -723,11 +799,12 @@ def run_claude(author, channel_id, prompt, history=""):
         cmd.append(instruction)
         return subprocess.run(
             cmd,
-            cwd=CLAUDE_CWD,
+            cwd=server_dir,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=TIMEOUT_SECONDS,
+            env=sub_env,
         )
 
     resume_id = get_session(channel_id) if SESSION_RESUME else None
@@ -824,6 +901,9 @@ def handle_message(channel_id, msg):
     # signal is now this reaction plus the progress posts Mochi makes itself; the
     # typing indicator is reserved for the moment we actually post the answer.
     react(channel_id, msg["id"], "👀")
+    # Which server this is in, so handling stays scoped to it (gateway events carry
+    # guild_id; REST poller messages don't, so fall back to the channel→guild map).
+    guild_id = msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id))
     reply = "Bridge error."
     try:
         # Serialize same-channel messages so they continue one conversation in
@@ -835,7 +915,7 @@ def handle_message(channel_id, msg):
                 print(f"[bridge] history fetch failed: {exc}", flush=True)
                 history = ""
             try:
-                reply = run_claude(author.get("username", author_id), channel_id, prompt, history)
+                reply = run_claude(author.get("username", author_id), channel_id, prompt, history, guild_id)
             except RateLimited as rl:
                 # Hit the limit mid-flight — queue it and tell the user it'll auto-resume.
                 defer_message(channel_id, msg, prompt)
@@ -858,7 +938,7 @@ def handle_message(channel_id, msg):
 
 
 def main():
-    mode = f"guild {GUILD_ID}" if GUILD_ID else f"channel {CHANNEL_ID}"
+    mode = f"{len(GUILD_IDS)} configured guild(s)" if GUILD_IDS else "all joined guilds"
     print(f"[bridge] started ({mode})", flush=True)
     cursors = load_cursors()
     while True:

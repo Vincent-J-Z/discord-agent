@@ -1,13 +1,13 @@
-"""Hourly proactive sweep.
+"""Hourly proactive sweep — per server, fully isolated.
 
-Gathers new activity across all watched channels/threads since the last sweep,
-then lets Claude (with its own persistent session, so it remembers prior sweeps)
-summarize it, assess whether anything needs attention/action, and decide whether
-to speak up — conservatively. Triggered by discord_agent_runtime on a timer.
+Gathers new activity since the last sweep and reviews EACH server separately:
+its own Claude session (`__sweep__<guild_id>`), its own toolbox scope
+(MOCHI_CURRENT_GUILD), and it only ever acts within that server. No server's
+activity is ever mixed with, or surfaced in, another. Triggered by
+discord_agent_runtime on a timer.
 
-Anti-spam by design: it posts a short digest to a REPORT channel (default: the
-maintenance channel) and only interjects elsewhere for genuinely important
-things. Default is to stay quiet.
+Anti-spam by design: stays silent unless something in THAT server genuinely needs
+a reply/action; then it acts in the relevant channel of that same server.
 """
 import json
 import os
@@ -24,8 +24,6 @@ load_dotenv(os.path.join(WORKSPACE, ".env"), override=True)
 load_dotenv(os.path.join(WORKSPACE, "secrets.env"), override=True)
 
 SWEEP_CURSORS = os.path.join(WORKSPACE, ".sweep_cursors.json")
-REPORT_CHANNEL = os.environ.get("SWEEP_REPORT_CHANNEL", "").strip() or b.CHANNEL_ID
-SWEEP_SESSION_KEY = "__sweep__"
 MAX_PER_CHANNEL = int(os.environ.get("SWEEP_MAX_PER_CHANNEL", "40"))
 
 
@@ -49,15 +47,15 @@ def _save(cursors):
 
 
 def gather():
-    """Return [(channel_id, [lines])] of new, non-noise activity since last sweep,
-    advancing per-channel cursors. New channels start at 'now' (no backlog)."""
+    """Return {guild_id: [(channel_id, [lines]), ...]} of new activity since the
+    last sweep, advancing per-channel cursors. New channels start at 'now'."""
     cursors = _load()
-    digest = []
     try:
-        channels = b.list_text_channels()
+        channels = b.list_text_channels()  # also populates b.CHANNEL_GUILD
     except Exception as exc:
         print(f"[sweep] channel list error: {exc}", flush=True)
-        return [], cursors
+        return {}, cursors
+    by_guild = {}
     for ch in channels:
         try:
             if ch not in cursors:
@@ -70,7 +68,7 @@ def gather():
         lines = []
         for m in msgs:
             cursors[ch] = m["id"]
-            author = (m.get("author") or {})
+            author = m.get("author") or {}
             if author.get("id") == b.BOT_ID:
                 continue
             body = b.WS_RE.sub(" ", m.get("content", "") or "").strip()
@@ -78,28 +76,36 @@ def gather():
                 continue
             lines.append(f"[{author.get('username', '?')}] {body[:500]}")
         if lines:
-            digest.append((ch, lines[-MAX_PER_CHANNEL:]))
-    return digest, cursors
+            gid = b.CHANNEL_GUILD.get(ch, "unknown")
+            by_guild.setdefault(gid, []).append((ch, lines[-MAX_PER_CHANNEL:]))
+    return by_guild, cursors
 
 
-def run_sweep(activity):
-    session_id = b.get_session(SWEEP_SESSION_KEY)
+def run_sweep(activity, guild_id):
+    session_key = f"__sweep__{guild_id}"
+    session_id = b.get_session(session_key)
     instruction = (
-        "You are Mochi_Bot doing your scheduled hourly review of this Discord "
-        "server. Below is the NEW activity since your last review.\n"
-        "1) Understand what's happening (relate it to prior reviews).\n"
-        "2) Decide whether anything genuinely needs a response or action FROM "
-        "YOU: an unanswered question you can answer, a task you should do or "
-        "flag, a problem you can help with.\n"
-        "3) If YES — respond or act in the RELEVANT channel using your tools "
-        "(discord_api.py). If NO — do NOTHING and post NOTHING; stay silent.\n"
-        "Default STRONGLY to silence: most hours warrant no message at all. Do "
-        "NOT post digests, summaries, or 'quiet hour' notes — silence is the "
-        "correct output when nothing needs you. Only speak when it clearly adds "
-        "value, and keep it brief. (Reply your one-line internal conclusion as "
-        "your text output — that's just logged, not posted to Discord.)\n"
-        f"(For a proactive note not tied to a specific channel, use channel {REPORT_CHANNEL}.)\n\n"
-        f"NEW ACTIVITY SINCE LAST REVIEW:\n{activity}"
+        "You are Mochi_Bot doing your scheduled hourly review of ONE Discord "
+        f"server (server {guild_id}). Below is the NEW activity in THIS server "
+        "since your last review of it.\n"
+        "STRICT ISOLATION: act ONLY within this server. NEVER read, reference, "
+        "mention, or act on any other server — your toolbox is scoped to this "
+        "server only, and you keep no cross-server context.\n"
+        "1) Understand what's happening (relate to prior reviews of this server).\n"
+        "2) Decide whether anything genuinely needs a response/action FROM YOU.\n"
+        "3) If YES — act in the relevant channel of THIS server (discord_api.py). "
+        "If NO — do NOTHING and post NOTHING; stay silent.\n"
+        "Default STRONGLY to silence: most hours warrant no message. Don't post "
+        "digests or 'quiet hour' notes. Your text output is just logged.\n\n"
+        f"NEW ACTIVITY:\n{activity}"
+    )
+    server_dir = b.ensure_server_dir(guild_id)
+    sub_env = dict(
+        os.environ,
+        MOCHI_CURRENT_GUILD=str(guild_id),
+        MOCHI_SERVER_DIR=server_dir,
+        CLAUDE_CONFIG_DIR=os.path.join(server_dir, ".claude"),
+        TMPDIR=os.path.join(server_dir, "tmp"),
     )
     cmd = [b.CLAUDE_BIN, "-p", "--permission-mode", b.PERMISSION_MODE, "--output-format", "json"]
     if b.CLAUDE_MODEL:
@@ -107,47 +113,47 @@ def run_sweep(activity):
     if session_id:
         cmd.extend(["--resume", session_id])
     cmd.append(instruction)
-    result = subprocess.run(
-        cmd, cwd=b.CLAUDE_CWD, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=b.TIMEOUT_SECONDS,
-    )
+
+    def run(c):
+        return subprocess.run(c, cwd=server_dir, text=True, env=sub_env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=b.TIMEOUT_SECONDS)
+
+    result = run(cmd)
     if result.returncode != 0 and session_id:  # stale session → retry fresh
-        b.clear_session(SWEEP_SESSION_KEY)
-        cmd = [c for c in cmd if c != session_id and c != "--resume"]
-        result = subprocess.run(
-            cmd, cwd=b.CLAUDE_CWD, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=b.TIMEOUT_SECONDS,
-        )
+        b.clear_session(session_key)
+        result = run([c for c in cmd if c not in (session_id, "--resume")])
     if result.returncode != 0:
-        print(f"[sweep] claude failed: {(result.stderr or result.stdout)[:300]}", flush=True)
+        print(f"[sweep] {guild_id} claude failed: {(result.stderr or result.stdout)[:200]}", flush=True)
         return
     try:
         data = json.loads(result.stdout or "{}")
         if data.get("session_id"):
-            b.set_session(SWEEP_SESSION_KEY, data["session_id"])
-        print(f"[sweep] done: {(data.get('result') or '')[:200]}", flush=True)
+            b.set_session(session_key, data["session_id"])
+        print(f"[sweep] {guild_id} done: {(data.get('result') or '')[:160]}", flush=True)
     except Exception:
-        print("[sweep] done (unparsed output)", flush=True)
+        print(f"[sweep] {guild_id} done (unparsed output)", flush=True)
 
 
 def main():
     if b.is_limited():
         print("[sweep] skipped — rate-limited", flush=True)
         return
-    digest, cursors = gather()
+    by_guild, cursors = gather()
     _save(cursors)
-    if not digest:
+    if not by_guild:
         print("[sweep] no new activity since last sweep", flush=True)
         return
-    blocks = []
-    for ch, lines in digest:
-        blocks.append(f"== channel {ch} ({len(lines)} new) ==\n" + "\n".join(lines))
-    activity = "\n\n".join(blocks)
-    print(f"[sweep] {sum(len(l) for _, l in digest)} new msgs across {len(digest)} channels — reviewing", flush=True)
-    try:
-        run_sweep(activity)
-    except subprocess.TimeoutExpired:
-        print("[sweep] review timed out", flush=True)
+    for guild_id, chans in by_guild.items():
+        if b.is_limited():
+            print("[sweep] rate-limited mid-sweep — stopping", flush=True)
+            break
+        blocks = [f"== channel {ch} ({len(lines)} new) ==\n" + "\n".join(lines) for ch, lines in chans]
+        n = sum(len(lines) for _, lines in chans)
+        print(f"[sweep] server {guild_id}: {n} new msg(s) across {len(chans)} channel(s) — reviewing", flush=True)
+        try:
+            run_sweep("\n\n".join(blocks), guild_id)
+        except subprocess.TimeoutExpired:
+            print(f"[sweep] {guild_id} review timed out", flush=True)
 
 
 if __name__ == "__main__":
