@@ -26,7 +26,7 @@ payload = {"content": txt, "allowed_mentions": {"parse": []}}
 if mid:
     r = httpx.patch(f"{BASE}/{mid}", json=payload, headers=H, timeout=20)
     if r.status_code == 200:
-        print("status edited", mid); raise SystemExit
+        raise SystemExit  # silent on routine success — no per-tick log spam
 # first time, or the message was deleted -> post a fresh one
 r = httpx.post(BASE, json=payload, headers=H, timeout=20)
 if r.status_code in (200, 201):

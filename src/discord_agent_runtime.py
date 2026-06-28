@@ -18,9 +18,15 @@ load_dotenv(os.path.join(ROOT, ".env"))
 load_dotenv(os.path.join(WORKSPACE, ".env"), override=True)
 
 TICK_SECONDS = int(os.environ.get("TICK_SECONDS", "60"))
-# Proactive hourly sweep (0 disables). Persisted so restarts don't reset the clock.
+# Proactive review cadence. Activity-driven with timed fallback (0 disables):
+#  - hourly fallback: review at least every SWEEP_INTERVAL even if all quiet
+#  - activity-driven: if a human posted since the last review AND at least
+#    SWEEP_MIN_GAP has passed, review early (so busy servers get seen in minutes,
+#    quiet ones fall back to hourly). The activity signal is written by the bridge.
 SWEEP_INTERVAL = int(os.environ.get("SWEEP_INTERVAL_SECONDS", "3600"))
+SWEEP_MIN_GAP = int(os.environ.get("SWEEP_MIN_GAP_SECONDS", "600"))
 LAST_SWEEP_FILE = os.path.join(WORKSPACE, ".last_sweep")
+ACTIVITY_FILE = os.path.join(WORKSPACE, ".activity")
 LIMITED_FILE = os.path.join(WORKSPACE, ".limited_until")
 DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred")
 
@@ -51,6 +57,25 @@ def _last_sweep():
 def _mark_sweep():
     with open(LAST_SWEEP_FILE, "w") as f:
         f.write(str(time.time()))
+
+
+def _activity_at():
+    try:
+        with open(ACTIVITY_FILE) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
+
+
+def _sweep_due():
+    """Single decision for the proactive review: hourly fallback OR activity-driven
+    (a human posted since last review and the min-gap has elapsed)."""
+    if SWEEP_INTERVAL <= 0:
+        return False
+    elapsed = time.time() - _last_sweep()
+    if elapsed >= SWEEP_INTERVAL:
+        return True
+    return SWEEP_MIN_GAP > 0 and elapsed >= SWEEP_MIN_GAP and _activity_at() > _last_sweep()
 
 
 def setup_ssh():
@@ -104,12 +129,12 @@ def main():
             if (resume is None or resume.poll() is not None) and _resume_due():
                 print("[runtime] rate limit cleared — draining deferred queue", flush=True)
                 resume = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_resume.py")])
-            # Hourly proactive sweep — only if the previous one has finished.
-            if SWEEP_INTERVAL > 0 and (sweep is None or sweep.poll() is not None):
-                if time.time() - _last_sweep() >= SWEEP_INTERVAL:
-                    _mark_sweep()
-                    print("[runtime] launching proactive sweep", flush=True)
-                    sweep = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_sweep.py")])
+            # Proactive review — activity-driven + hourly fallback, only if the
+            # previous one has finished.
+            if (sweep is None or sweep.poll() is not None) and _sweep_due():
+                _mark_sweep()
+                print("[runtime] launching proactive sweep", flush=True)
+                sweep = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_sweep.py")])
             status_body = os.path.join(WORKSPACE, ".status.md")
             if os.path.exists(status_body):
                 subprocess.run([sys.executable, os.path.join(ROOT, "discord_status.py")], check=False)

@@ -85,12 +85,11 @@ def run_sweep(activity, guild_id):
     session_key = f"__sweep__{guild_id}"
     session_id = b.get_session(session_key)
     instruction = (
-        "You are Mochi_Bot doing your scheduled hourly review of ONE Discord "
-        f"server (server {guild_id}). Below is the NEW activity in THIS server "
-        "since your last review of it.\n"
-        "STRICT ISOLATION: act ONLY within this server. NEVER read, reference, "
-        "mention, or act on any other server — your toolbox is scoped to this "
-        "server only, and you keep no cross-server context.\n"
+        "You are Mochi_Bot doing your scheduled hourly review of this Discord "
+        "server. Below is the NEW activity in it since your last review.\n"
+        "Stay within this server and your working directory; the toolbox is "
+        "scoped to this server. Never reference, reveal, or act on anything "
+        "outside it (other deployments, paths, or directory layout).\n"
         "1) Understand what's happening (relate to prior reviews of this server).\n"
         "2) Decide whether anything genuinely needs a response/action FROM YOU.\n"
         "3) If YES — act in the relevant channel of THIS server (discord_api.py). "
@@ -110,6 +109,8 @@ def run_sweep(activity, guild_id):
     cmd = [b.CLAUDE_BIN, "-p", "--permission-mode", b.PERMISSION_MODE, "--output-format", "json"]
     if b.CLAUDE_MODEL:
         cmd.extend(["--model", b.CLAUDE_MODEL])
+    if b.CLAUDE_EFFORT:
+        cmd.extend(["--effort", b.CLAUDE_EFFORT])
     if session_id:
         cmd.extend(["--resume", session_id])
     cmd.append(instruction)

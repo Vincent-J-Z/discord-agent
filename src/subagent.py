@@ -110,13 +110,19 @@ def _write_runner(command, name, channel, report):
     ]
     if report and channel:
         api = shlex.quote(os.path.join(ROOT, "discord_api.py"))
-        msg = (
-            f"🤖 sub-agent `{name}` finished (exit $(cat {shlex.quote(done)})). "
-            f"tail: $(tail -n 3 {shlex.quote(log)} | tr '\\n' ' ' | cut -c1-300)"
-        )
-        lines.append(
-            f'python {api} post {shlex.quote(str(channel))} "{msg}" >/dev/null 2>&1 || true'
-        )
+        # Build the message into a shell variable with the dynamic parts captured
+        # FIRST, then post "$MSG" as a single argv. This keeps backticks / quotes /
+        # $(...) that may appear in the log tail INERT — they're never re-parsed by
+        # the shell. (The old form interpolated `{name}` and $(tail ...) straight
+        # into a double-quoted argument, so a kebab-case name like `video-demo`
+        # was command-substituted away and a `"` in the tail broke the post.)
+        prefix = shlex.quote(f"🤖 sub-agent `{name}` finished (exit ")
+        lines += [
+            f"EXIT=$(cat {shlex.quote(done)} 2>/dev/null)",
+            f"TAIL=$(tail -n 3 {shlex.quote(log)} 2>/dev/null | tr '\\n\\r\\t' '   ' | cut -c1-300)",
+            f'MSG="$(printf \'%s%s). tail: %s\' {prefix} "$EXIT" "$TAIL")"',
+            f'python {api} post {shlex.quote(str(channel))} "$MSG" >/dev/null 2>&1 || true',
+        ]
     lines.append("sleep 2")  # keep the pane briefly so `logs` works right after exit
     path = os.path.join(STATE_DIR, name + ".sh")
     with open(path, "w") as f:

@@ -17,7 +17,7 @@ network, and tool access — running headless inside a hardened container.
 ## Layout
 ```
 src/        Python runtime (bridge, gateway, sweep, toolbox, …)
-docs/       HANDOFF.md (setup), FEATURE-REPORT.md (roadmap)
+docs/       DEPLOY.md (full deploy guide), FEATURE-REPORT.md (roadmap)
 examples/   .env / secrets / compose templates
 CLAUDE.md   the bot's operating context (loaded by claude each run, cwd=/app)
 Containerfile · compose.yaml · run-container.sh · autostart.sh   build/run/boot
@@ -33,12 +33,14 @@ Containerfile · compose.yaml · run-container.sh · autostart.sh   build/run/bo
 | `discord_poll.py` / `discord_status.py` / `post_message.py` | One-shot poll, live status board, REST post helper. |
 
 ## Setup
-See [docs/HANDOFF.md](docs/HANDOFF.md) for full setup. In short:
+See **[docs/DEPLOY.md](docs/DEPLOY.md)** for the full deploy guide (Discord setup,
+tokens, build, run, autostart, every env var). In short:
 
 ```bash
 cp examples/.env.example ~/discordAgentWorkspace/.env      # fill in token, ids, OAuth token
 cp examples/secrets.env.example ~/discordAgentWorkspace/secrets.env   # optional task creds
-./run-container.sh                                 # build is via Containerfile
+container build -t discord-agent:local -f Containerfile .
+./run-container.sh
 ```
 
 ## Configuration

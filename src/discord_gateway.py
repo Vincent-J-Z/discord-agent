@@ -45,14 +45,17 @@ POOL = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
 
 # Hot-reload safety: a source edit must NOT kill a reply that's mid-flight (that
 # made the bot "go silent" right after editing its own code). We count active
-# handlers and, once a reload is pending, stop taking new work and wait for the
-# in-flight ones to finish posting before re-exec'ing. Bounded by a grace cap so
-# a stuck/very-long job can't block the reload forever (those should be
-# backgrounded per CLAUDE.md anyway).
+# handlers and, once a reload is pending, stop taking new work and wait for ALL
+# in-flight ones to finish posting before re-exec'ing. Default: wait until they
+# truly drain (RELOAD_GRACE=0) — every handler is already hard-bounded by the
+# claude subprocess timeout (~TIMEOUT_SECONDS), so this can't hang forever, and
+# we never want to drop a reply just because an edit landed. Set
+# RELOAD_GRACE_SECONDS>0 only if you want an absolute backstop that force-reloads
+# even with handlers still running (their replies may be dropped).
 _inflight = 0
 _inflight_lock = threading.Lock()
 _reloading = threading.Event()
-RELOAD_GRACE = int(os.environ.get("RELOAD_GRACE_SECONDS", "300"))
+RELOAD_GRACE = int(os.environ.get("RELOAD_GRACE_SECONDS", "0"))
 
 SELF = os.path.abspath(__file__)
 WATCH = [SELF, os.path.join(ROOT, "discord_claude_bridge.py")]
@@ -147,11 +150,14 @@ async def reload_watcher():
             while True:
                 with _inflight_lock:
                     n = _inflight
-                if n == 0 or waited >= RELOAD_GRACE:
+                if n == 0:
+                    break
+                if RELOAD_GRACE and waited >= RELOAD_GRACE:
                     break
                 if waited == 0.0:
+                    cap = f"grace {RELOAD_GRACE}s" if RELOAD_GRACE else "waiting until all finish"
                     print(f"[gateway] source changed — draining {n} in-flight "
-                          f"handler(s) before reload (grace {RELOAD_GRACE}s)", flush=True)
+                          f"handler(s) before reload ({cap})", flush=True)
                 await asyncio.sleep(0.5)
                 waited += 0.5
             if n:

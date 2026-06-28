@@ -45,6 +45,14 @@ ROLE_ID = os.environ.get("DISCORD_ROLE_ID", "").strip()
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_CWD = os.environ.get("CLAUDE_CWD", ROOT)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
+# Reasoning effort: low | medium | high | xhigh | max. Higher = more thinking
+# (better on hard tasks, but slower and burns more quota). Blank = claude default.
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip()
+# Live telemetry: stream claude's output (stream-json) so the monitor can show
+# each agent's thinking/tool-use in real time. Set STREAM_TELEMETRY=0 to fall back
+# to the plain one-shot json path (instant escape hatch if streaming misbehaves).
+STREAM_TELEMETRY = os.environ.get("STREAM_TELEMETRY", "1").strip().lower() not in ("0", "", "false", "no")
+RUNS_DIR = os.path.join(WORKSPACE, ".runs")
 # Permission mode for the in-container claude. "dontAsk" blocks ALL shell
 # execution (claude can only read/write files); that's why the bot couldn't
 # post, run pipelines, etc. "bypassPermissions" lets it actually act — safe here
@@ -53,6 +61,52 @@ PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions").
 TICK_SECONDS = int(os.environ.get("TICK_SECONDS", "10"))
 MAX_RESPONSE_CHARS = int(os.environ.get("MAX_RESPONSE_CHARS", "1800"))
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "20"))
+# Tiered context (opt-in via COMPACT_HISTORY=1). When on, fetch a deeper window,
+# keep the last HISTORY_VERBATIM messages verbatim, and fold everything older
+# into a running summary produced by a small/cheap model (COMPACT_MODEL). The
+# summary is cached per-channel and updated incrementally (only newly aged-out
+# messages get summarized each turn), so we don't re-compress the whole backlog.
+# Any failure degrades gracefully back to the flat HISTORY_LIMIT behavior.
+COMPACT_HISTORY = os.environ.get("COMPACT_HISTORY", "0").strip().lower() not in ("0", "", "false", "no")
+HISTORY_VERBATIM = int(os.environ.get("HISTORY_VERBATIM", "8"))   # newest msgs kept raw
+HISTORY_DEEP = int(os.environ.get("HISTORY_DEEP", "120"))         # max msgs ever pulled
+COMPACT_MODEL = os.environ.get("COMPACT_MODEL", "haiku").strip()
+COMPACT_TIMEOUT = int(os.environ.get("COMPACT_TIMEOUT_SECONDS", "60"))
+COMPACT_MAX_WORDS = int(os.environ.get("COMPACT_MAX_WORDS", "180"))
+HISTORY_COMPACT_DIR = os.path.join(WORKSPACE, ".history_compact")
+# Drop-from-context marking (opt-in via DROP_MARKED_FROM_CONTEXT=1). When on, any
+# message someone reacts to with DROP_MARK_EMOJI (default ❌) is removed from the
+# context window the model sees; if the marked message is a user message, the
+# contiguous run of the bot's own replies right after it is dropped too — so
+# marking a Q&A with ❌ makes that whole exchange stop participating in future
+# context. It does NOT delete anything on Discord. Caveat: a message already
+# folded into the tiered rolling summary can't be retroactively un-summarized;
+# this reliably hides messages still in the verbatim/unsummarized range (the
+# common case: you mark something you just saw). Degrades to no-op on any error.
+DROP_MARKED = os.environ.get("DROP_MARKED_FROM_CONTEXT", "0").strip().lower() not in ("0", "", "false", "no")
+DROP_MARK_EMOJI = os.environ.get("DROP_MARK_EMOJI", "❌").strip()
+# DELETE marked messages on Discord — a DISTINCT, heavier action from drop. The
+# delete mark is a SEPARATE emoji (DELETE_MARK_EMOJI, default 🗑️) so ❌ stays safe
+# ("just ignore from context, reversible") and only 🗑️ actually removes the
+# message. A bare reaction doesn't wake the bot, so deletion runs as an
+# activity-gated sweep on the tick loop (see sweep_marked_deletions): it deletes
+# anything bearing DELETE_MARK_EMOJI plus the bot's reply run right after a marked
+# user message. Deleting the bot's own messages always works; deleting someone
+# else's needs the "Manage Messages" permission — without it those just stay
+# (still hidden from context). Opt-in, global single-process switch. Best-effort.
+DELETE_MARKED = os.environ.get("DELETE_MARKED_MESSAGES", "0").strip().lower() not in ("0", "", "false", "no")
+DELETE_MARK_EMOJI = os.environ.get("DELETE_MARK_EMOJI", "🗑️").strip()
+DELETE_SWEEP_LIMIT = int(os.environ.get("DELETE_SWEEP_LIMIT", "50"))  # msgs scanned/sweep/channel
+# Marked-deletion sweep is activity-gated: it runs for a channel when that channel
+# had new messages this tick, plus a coarse fallback so a 🗑️ on a quiet channel
+# still gets caught within this interval. Avoids scanning every channel every tick.
+MARK_SWEEP_FALLBACK = int(os.environ.get("MARK_SWEEP_FALLBACK_SECONDS", "300"))
+_DELETE_SKIP = set()       # message ids we already tried and couldn't delete (e.g. no perm)
+_LAST_MARK_SWEEP = {}      # channel_id -> last sweep epoch
+# Single activity signal shared with the runtime: bumped whenever a human posts.
+# Both the marked-deletion sweep (here) and the proactive review (runtime) key off
+# real activity instead of each keeping its own blind timer.
+ACTIVITY_FILE = os.path.join(WORKSPACE, ".activity")
 TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "240"))
 # Per-channel "last seen message id" cursors, so each channel is tracked
 # independently. Replaces the old single-channel .claude_bridge_seen file.
@@ -358,28 +412,204 @@ def fetch_messages(channel_id, after):
     return sorted(messages, key=lambda msg: int(msg["id"]))
 
 
-def fetch_recent(channel_id, before_id):
-    """Return the last HISTORY_LIMIT messages in `channel_id` before `before_id`,
-    oldest-first, as plain "[author] text" lines for context. Same token/endpoint
-    as fetch_messages — no extra permissions."""
+def _msg_line(msg):
+    name = (msg.get("author") or {}).get("username", "?")
+    body = WS_RE.sub(" ", msg.get("content", "") or "").strip()
+    return f"[{name}] {body}" if body else ""
+
+
+def _fetch_before(channel_id, before_id, want):
+    """Fetch up to `want` messages strictly before `before_id`, oldest-first,
+    paginating in pages of 100 (Discord's per-request cap)."""
+    out = []
+    cursor = before_id
+    with httpx.Client(timeout=20, headers=HEADERS) as client:
+        while len(out) < want:
+            page = min(100, want - len(out))
+            response = client.get(
+                f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                params={"limit": page, "before": cursor},
+            )
+            response.raise_for_status()
+            batch = response.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            out.extend(batch)                       # API returns newest-first
+            cursor = min(batch, key=lambda m: int(m["id"]))["id"]
+            if len(batch) < page:
+                break
+    return sorted(out, key=lambda m: int(m["id"]))  # oldest-first
+
+
+def _reacted_with(msg, emoji):
+    for r in (msg.get("reactions") or []):
+        if (r.get("emoji") or {}).get("name") == emoji:
+            return True
+    return False
+
+
+def _has_drop_mark(msg):
+    # Either mark hides from context; 🗑️ additionally gets the message deleted.
+    return _reacted_with(msg, DROP_MARK_EMOJI) or _reacted_with(msg, DELETE_MARK_EMOJI)
+
+
+def _has_delete_mark(msg):
+    return _reacted_with(msg, DELETE_MARK_EMOJI)
+
+
+def _drop_marked(msgs):
+    """Messages oldest-first in, filtered out. Removes any message reacted with
+    DROP_MARK_EMOJI or DELETE_MARK_EMOJI; when a marked message is from a user,
+    also removes the contiguous run of bot replies immediately after it. No-op
+    unless DROP_MARKED is on. Never raises — returns the input unchanged on error."""
+    if not DROP_MARKED or not msgs:
+        return msgs
+    try:
+        drop = [False] * len(msgs)
+        for i, m in enumerate(msgs):
+            if _has_drop_mark(m):
+                drop[i] = True
+                if (m.get("author") or {}).get("id") != BOT_ID:
+                    j = i + 1
+                    while j < len(msgs) and (msgs[j].get("author") or {}).get("id") == BOT_ID:
+                        drop[j] = True
+                        j += 1
+        return [m for m, d in zip(msgs, drop) if not d]
+    except Exception:
+        return msgs
+
+
+def _fetch_recent_flat(channel_id, before_id):
+    """Original behavior: last HISTORY_LIMIT messages as plain lines."""
     if HISTORY_LIMIT <= 0:
         return ""
-    with httpx.Client(timeout=20, headers=HEADERS) as client:
-        response = client.get(
-            f"https://discord.com/api/v10/channels/{channel_id}/messages",
-            params={"limit": HISTORY_LIMIT, "before": before_id},
+    # When dropping marked messages, over-fetch so the window still fills up.
+    want = HISTORY_LIMIT * 3 if DROP_MARKED else HISTORY_LIMIT
+    msgs = _drop_marked(_fetch_before(channel_id, before_id, want))[-HISTORY_LIMIT:]
+    return "\n".join(filter(None, (_msg_line(m) for m in msgs)))
+
+
+def _compact_cache_path(channel_id):
+    return os.path.join(HISTORY_COMPACT_DIR, f"{channel_id}.json")
+
+
+def _load_compact_cache(channel_id):
+    try:
+        with open(_compact_cache_path(channel_id)) as f:
+            data = json.load(f)
+        return str(data.get("up_to") or "0"), str(data.get("summary") or "")
+    except Exception:
+        return "0", ""
+
+
+def _save_compact_cache(channel_id, up_to, summary):
+    try:
+        os.makedirs(HISTORY_COMPACT_DIR, exist_ok=True)
+        path = _compact_cache_path(channel_id)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"up_to": str(up_to), "summary": summary}, f)
+        os.replace(tmp, path)
+    except Exception as exc:
+        print(f"[bridge] compact cache write failed for {channel_id}: {exc}", flush=True)
+
+
+def _small_model_summary(prompt):
+    """One-shot summarization via a cheap model, tools disabled. Returns the
+    text, or "" on any failure so callers can degrade gracefully."""
+    cmd = [
+        CLAUDE_BIN, "-p",
+        "--permission-mode", "dontAsk",   # read-only: no shell, just summarize
+        "--output-format", "json",
+        "--model", COMPACT_MODEL,
+        prompt,
+    ]
+    try:
+        result = subprocess.run(
+            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=COMPACT_TIMEOUT, env=dict(os.environ),
         )
-        response.raise_for_status()
-        messages = response.json()
-    if not isinstance(messages, list):
+        if result.returncode != 0:
+            return ""
+        out = result.stdout.strip()
+        try:
+            return (json.loads(out).get("result") or "").strip()
+        except Exception:
+            return out
+    except Exception as exc:
+        print(f"[bridge] compact summarize failed: {exc}", flush=True)
         return ""
-    lines = []
-    for msg in sorted(messages, key=lambda m: int(m["id"])):
-        name = (msg.get("author") or {}).get("username", "?")
-        body = WS_RE.sub(" ", msg.get("content", "") or "").strip()
-        if body:
-            lines.append(f"[{name}] {body}")
-    return "\n".join(lines)
+
+
+def _compact_summary(channel_id, older):
+    """Incremental running summary of the `older` messages (oldest-first).
+    Only messages newer than what the cache already covers get folded in."""
+    if not older:
+        return ""
+    newest_id = older[-1]["id"]
+    up_to, summary = _load_compact_cache(channel_id)
+    if summary and up_to == str(newest_id):
+        return summary                              # nothing aged in since last turn
+    fresh = [m for m in older if int(m["id"]) > int(up_to)] if up_to != "0" else older
+    fresh_lines = "\n".join(filter(None, (_msg_line(m) for m in fresh)))
+    if not fresh_lines:
+        return summary
+    if summary and len(fresh) < len(older):
+        prompt = (
+            "You maintain a rolling summary of an ongoing Discord conversation, "
+            f"for an assistant's context. Keep it under {COMPACT_MAX_WORDS} words, "
+            "preserving who asked what, decisions/answers reached, and any open "
+            "tasks; drop small talk.\n\n"
+            f"--- Existing summary ---\n{summary}\n\n"
+            f"--- New messages to fold in ---\n{fresh_lines}\n\n"
+            "Return ONLY the updated summary."
+        )
+    else:
+        prompt = (
+            "Summarize this Discord conversation for an assistant's context. "
+            f"Keep it under {COMPACT_MAX_WORDS} words, preserving who asked what, "
+            "decisions/answers reached, and any open tasks; drop small talk.\n\n"
+            f"{fresh_lines}\n\nReturn ONLY the summary."
+        )
+    new_summary = _small_model_summary(prompt)
+    if not new_summary:
+        return summary                              # degrade: keep what we had
+    _save_compact_cache(channel_id, newest_id, new_summary)
+    return new_summary
+
+
+def _fetch_recent_tiered(channel_id, before_id):
+    """Deep window split into a summarized head + verbatim tail."""
+    msgs = _drop_marked(_fetch_before(channel_id, before_id, HISTORY_DEEP))
+    if not msgs:
+        return ""
+    tail = msgs[-HISTORY_VERBATIM:] if HISTORY_VERBATIM > 0 else msgs
+    older = msgs[: -HISTORY_VERBATIM] if HISTORY_VERBATIM > 0 else []
+    verbatim = "\n".join(filter(None, (_msg_line(m) for m in tail)))
+    summary = _compact_summary(channel_id, older)
+    if not summary:
+        return verbatim
+    return (
+        f"[Earlier conversation — summarized]\n{summary}\n\n"
+        f"[Most recent messages — verbatim]\n{verbatim}"
+    )
+
+
+def fetch_recent(channel_id, before_id):
+    """Context window before `before_id`, oldest-first. Flat last-N lines by
+    default; tiered summary+verbatim when COMPACT_HISTORY is on. Same token /
+    endpoint as fetch_messages — no extra permissions. Never raises: on error
+    it falls back to the flat window (or empty)."""
+    try:
+        if COMPACT_HISTORY:
+            return _fetch_recent_tiered(channel_id, before_id)
+        return _fetch_recent_flat(channel_id, before_id)
+    except Exception as exc:
+        print(f"[bridge] fetch_recent failed for {channel_id}: {exc}", flush=True)
+        try:
+            return _fetch_recent_flat(channel_id, before_id)
+        except Exception:
+            return ""
 
 
 def fetch_latest_id(channel_id):
@@ -438,28 +668,138 @@ def post(channel_id, content, mention_user_id=None):
 
 
 def react(channel_id, message_id, emoji="👀"):
-    """Best-effort emoji ack so the sender knows the message was seen."""
-    try:
-        with httpx.Client(timeout=10, headers=HEADERS) as client:
-            client.put(
-                f"https://discord.com/api/v10/channels/{channel_id}/messages/"
-                f"{message_id}/reactions/{quote(emoji)}/@me"
-            )
-    except Exception:
-        pass
+    """Best-effort emoji ack so the sender knows the message was seen.
+
+    Returns True if Discord confirmed it (2xx), else False. We check the status
+    and retry once on a 429 (rate limit) — the ✅ done-mark in particular must
+    survive a transient hiccup, otherwise the message ends up with no ack at all.
+    """
+    url = (
+        f"https://discord.com/api/v10/channels/{channel_id}/messages/"
+        f"{message_id}/reactions/{quote(emoji)}/@me"
+    )
+    for attempt in range(2):
+        try:
+            with httpx.Client(timeout=10, headers=HEADERS) as client:
+                resp = client.put(url)
+            if resp.status_code < 300:
+                return True
+            if resp.status_code == 429 and attempt == 0:
+                try:
+                    time.sleep(min(5.0, float(resp.json().get("retry_after", 1))))
+                except Exception:
+                    time.sleep(1.0)
+                continue
+        except Exception:
+            pass
+        break
+    return False
 
 
 def unreact(channel_id, message_id, emoji):
-    """Best-effort removal of our own reaction (to swap the working ack for a
-    done one once the reply is posted)."""
+    """Remove our own reaction (to swap the working ack for a done one once the
+    reply is posted). Checks status and retries once on 429 — same as react():
+    a swallowed failure here leaves BOTH the 👀/⏳ and the ✅ on the message,
+    which looks half-done. Returns True if Discord confirmed the removal."""
+    url = (
+        f"https://discord.com/api/v10/channels/{channel_id}/messages/"
+        f"{message_id}/reactions/{quote(emoji)}/@me"
+    )
+    for attempt in range(2):
+        try:
+            with httpx.Client(timeout=10, headers=HEADERS) as client:
+                resp = client.delete(url)
+            if resp.status_code < 300 or resp.status_code == 404:
+                return True  # 404 = already gone, also fine
+            if resp.status_code == 429 and attempt == 0:
+                try:
+                    time.sleep(min(5.0, float(resp.json().get("retry_after", 1))))
+                except Exception:
+                    time.sleep(1.0)
+                continue
+        except Exception:
+            pass
+        break
+    return False
+
+
+def delete_message(channel_id, message_id):
+    """Best-effort delete. True on success; False on failure (e.g. 403 = we lack
+    Manage Messages for someone else's message)."""
     try:
         with httpx.Client(timeout=10, headers=HEADERS) as client:
-            client.delete(
-                f"https://discord.com/api/v10/channels/{channel_id}/messages/"
-                f"{message_id}/reactions/{quote(emoji)}/@me"
+            r = client.delete(
+                f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
             )
+        if r.status_code in (200, 204):
+            return True
+        if r.status_code == 403:
+            print(f"[bridge] delete forbidden {channel_id}/{message_id} (need Manage Messages)", flush=True)
+        return False
+    except Exception as exc:
+        print(f"[bridge] delete failed {channel_id}/{message_id}: {exc}", flush=True)
+        return False
+
+
+def _touch_activity():
+    """Record that a human just posted, for activity-driven schedulers (runtime
+    proactive review). Best-effort."""
+    try:
+        with open(ACTIVITY_FILE, "w") as f:
+            f.write(str(time.time()))
     except Exception:
         pass
+
+
+def _fetch_latest_raw(channel_id, limit):
+    """Latest `limit` raw message objects, oldest-first. Empty on error/denied."""
+    if channel_id in DENIED:
+        return []
+    with httpx.Client(timeout=20, headers=HEADERS) as client:
+        r = client.get(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            params={"limit": min(100, max(1, limit))},
+        )
+    if r.status_code == 403:
+        DENIED.add(channel_id)
+        return []
+    r.raise_for_status()
+    batch = r.json()
+    if not isinstance(batch, list):
+        return []
+    return sorted(batch, key=lambda m: int(m["id"]))
+
+
+def sweep_marked_deletions(channel_id):
+    """Sweep: delete messages reacted with DELETE_MARK_EMOJI (plus the bot's reply
+    run right after a marked user message). No-op unless DELETE_MARKED is on.
+    Never raises."""
+    if not DELETE_MARKED:
+        return
+    try:
+        msgs = _fetch_latest_raw(channel_id, DELETE_SWEEP_LIMIT)
+        if not msgs:
+            return
+        n = len(msgs)
+        targets = []
+        for i, m in enumerate(msgs):
+            if _has_delete_mark(m):
+                targets.append(m)
+                if (m.get("author") or {}).get("id") != BOT_ID:
+                    j = i + 1
+                    while j < n and (msgs[j].get("author") or {}).get("id") == BOT_ID:
+                        targets.append(msgs[j])
+                        j += 1
+        seen = set()
+        for m in targets:
+            mid = m["id"]
+            if mid in seen or mid in _DELETE_SKIP:
+                continue
+            seen.add(mid)
+            if not delete_message(channel_id, mid):
+                _DELETE_SKIP.add(mid)   # don't hammer un-deletable messages every tick
+    except Exception as exc:
+        print(f"[bridge] sweep_marked_deletions failed for {channel_id}: {exc}", flush=True)
 
 
 def _typing_burst(channel_id, reply_len):
@@ -571,7 +911,7 @@ def log_usage(channel_id, author, data):
         pass
 
 
-def build_status():
+def build_status(guild_id=None):
     up = int(time.time() - START_TIME)
     h, rem = divmod(up, 3600)
     m = rem // 60
@@ -586,8 +926,10 @@ def build_status():
                     pass
     except FileNotFoundError:
         pass
+    # Count only THIS server's channels — never expose the cross-server total.
     try:
-        watched = len(list_text_channels())
+        list_text_channels()  # refresh CHANNEL_GUILD
+        watched = sum(1 for g in CHANNEL_GUILD.values() if g == str(guild_id)) if guild_id else "?"
     except Exception:
         watched = "?"
     limit_line = ""
@@ -595,7 +937,7 @@ def build_status():
         limit_line = f"\n• ⏳ 额度受限,约 {fmt_utc(limited_until())} 恢复(已排队 {len(list_deferred())} 条)"
     return (
         "**Status**\n"
-        f"• model: `{CLAUDE_MODEL or 'default'}` · perms: `{PERMISSION_MODE}`\n"
+        f"• model: `{CLAUDE_MODEL or 'default'}` · effort: `{CLAUDE_EFFORT or 'default'}` · perms: `{PERMISSION_MODE}`\n"
         f"• session resume: {'on' if SESSION_RESUME else 'off'} · watched: {watched} channels\n"
         f"• uptime: {h}h{m}m · handled runs: {n} · 累计成本: ${total:.2f}"
         f"{limit_line}"
@@ -717,6 +1059,13 @@ def drain_deferred():
             reply = f"Bridge error: {exc}"
         try:
             post_reply(ch, reply, mention_user_id=rec.get("author_id"))
+            # Mark the original message done, same as the live path: add ✅ then
+            # clear the waiting acks (⏳ from deferral, 👀 from receipt). Without
+            # this a resumed-from-queue task stayed stuck on ⏳ forever.
+            mid = rec.get("message_id")
+            if mid and react(ch, mid, "✅"):
+                unreact(ch, mid, "⏳")
+                unreact(ch, mid, "👀")
         finally:
             try:
                 os.remove(path)
@@ -742,6 +1091,122 @@ def ensure_server_dir(guild_id):
     return base
 
 
+_run_lock = threading.Lock()
+
+
+def write_run(run_id, **fields):
+    """Update an agent run's live telemetry file (read by monitor.py)."""
+    try:
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        path = os.path.join(RUNS_DIR, run_id + ".json")
+        with _run_lock:
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            data.update(fields)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def clear_run(run_id):
+    try:
+        os.remove(os.path.join(RUNS_DIR, run_id + ".json"))
+    except OSError:
+        pass
+
+
+class _Res:
+    """A subprocess.run-compatible result so the streaming path is a drop-in."""
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _stream_claude(cmd, cwd, env, run_id):
+    """Run claude with stream-json, writing live phase/thinking to the run's
+    telemetry as events arrive. Returns a result whose stdout is the final
+    `result` event (so the caller's json parsing is unchanged). Raises
+    subprocess.TimeoutExpired on timeout, like subprocess.run did."""
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1,
+    )
+    write_run(run_id, pid=proc.pid, status="running", phase="starting", updated=time.time())
+    final = None
+    think = ""
+    last_write = 0.0
+    timed_out = {"v": False}
+
+    def _kill():
+        timed_out["v"] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    timer = threading.Timer(TIMEOUT_SECONDS, _kill)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            t = ev.get("type")
+            phase = None
+            if t == "stream_event":
+                d = (ev.get("event") or {}).get("delta") or {}
+                if d.get("type") == "thinking_delta":
+                    think += d.get("thinking", "")
+                    phase = "💭 thinking"
+                elif d.get("type") == "text_delta":
+                    think += d.get("text", "")
+                    phase = "✍️ replying"
+            elif t == "assistant":
+                for blk in (ev.get("message") or {}).get("content") or []:
+                    bt = blk.get("type")
+                    if bt == "tool_use":
+                        nm = blk.get("name", "tool")
+                        inp = blk.get("input") or {}
+                        arg = inp.get("command") or inp.get("file_path") or inp.get("path") or inp.get("pattern") or ""
+                        think = f"{nm}: {str(arg)[:140]}"
+                        phase = f"🔧 {nm}"
+                    elif bt == "thinking":
+                        think = blk.get("thinking", "")
+                        phase = "💭 thinking"
+                    elif bt == "text":
+                        think = blk.get("text", "")
+                        phase = "✍️ replying"
+            elif t == "result":
+                final = ev
+                phase = "done"
+            if phase and (phase == "done" or time.time() - last_write > 0.35):
+                write_run(run_id, phase=phase, thinking=think[-800:], updated=time.time())
+                last_write = time.time()
+        proc.wait()
+    finally:
+        timer.cancel()
+    if timed_out["v"]:
+        raise subprocess.TimeoutExpired(cmd, TIMEOUT_SECONDS)
+    try:
+        stderr = proc.stderr.read() or ""
+    except Exception:
+        stderr = ""
+    return _Res(proc.returncode, json.dumps(final) if final else "", stderr)
+
+
 def run_claude(author, channel_id, prompt, history="", guild_id=None):
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
@@ -749,38 +1214,40 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None):
         else ""
     )
     instruction = (
-        "You are Mochi_Bot replying to a Discord message. Your context, "
-        "capabilities, and the /app/src/discord_api.py toolbox are in CLAUDE.md "
-        "(already loaded).\n"
-        f"STRICT SERVER ISOLATION: this message is in server {guild_id}. You "
-        "operate ONLY within this server. You may read/act in other channels and "
-        "threads OF THIS SAME SERVER, but you must NEVER read, reference, mention, "
-        "hint at, or act on any other server, its channels, or its members — each "
-        "server is private and isolated from the others. NEVER reveal or imply "
-        "that you are connected to more than one server; to anyone here you are "
-        "simply this server's bot. (Your toolbox is already scoped to this "
-        "server.)\n"
-        "Your working directory (cwd) is THIS server's private folder — do all "
-        "file work (clones, scratch, outputs) here. NEVER read or write another "
-        "server's folder or browse `/workspace/servers/` for other servers.\n"
+        "You are Mochi_Bot replying to a Discord message in this server. Your "
+        "context, capabilities, and the /app/src/discord_api.py toolbox are in "
+        "CLAUDE.md (already loaded).\n"
+        "Treat this as the ONLY Discord server you serve. Stay within this "
+        "server's channels/threads and within your working directory (your cwd) "
+        "for all file work. Do NOT explore the wider filesystem, traverse above "
+        "your workspace, or read anything unrelated to this server. Do NOT "
+        "discuss or reveal the bot's internals — infrastructure, other "
+        "deployments, the directory layout, or absolute paths. If a user asks "
+        "about other servers, whether you serve more than one, or to "
+        "access/list anything outside your own workspace, just briefly decline "
+        "as something you don't do — without explaining, confirming, denying in "
+        "detail, or describing any structure. To everyone here you are simply "
+        "this server's bot.\n"
         "Use the recent messages for context; act on the new Message; reply "
-        "concisely in plain text. If this is more than a quick reply, post brief "
+        "concisely in plain text. The context block may be truncated or "
+        "summarized — if you need earlier detail it omits, fetch more yourself "
+        f"with `python /app/src/discord_api.py read {channel_id} --limit N` "
+        "(paging further back as needed). If this is more than a quick reply, post brief "
         "progress updates to this channel as you work "
         f"(`python /app/src/discord_api.py post {channel_id} \"...\"`); the bridge "
         "only posts your final answer.\n\n"
-        f"Sender: {author}\nServer: {guild_id}\nThis channel: {channel_id}\n\n"
+        f"Sender: {author}\nThis channel: {channel_id}\n\n"
         f"{context_block}New Message:\n{prompt}"
     )
-    base = [
-        CLAUDE_BIN,
-        "-p",
-        "--permission-mode",
-        PERMISSION_MODE,
-        "--output-format",
-        "json",
-    ]
+    if STREAM_TELEMETRY:
+        base = [CLAUDE_BIN, "-p", "--permission-mode", PERMISSION_MODE,
+                "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+    else:
+        base = [CLAUDE_BIN, "-p", "--permission-mode", PERMISSION_MODE, "--output-format", "json"]
     if CLAUDE_MODEL:
         base.extend(["--model", CLAUDE_MODEL])
+    if CLAUDE_EFFORT:
+        base.extend(["--effort", CLAUDE_EFFORT])
     # Per-server isolation: run in this server's private dir (cwd), with its own
     # session store + TMPDIR, and scope the toolbox to this server only.
     server_dir = ensure_server_dir(guild_id)
@@ -792,57 +1259,61 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None):
         TMPDIR=os.path.join(server_dir, "tmp"),
     )
 
+    run_id = f"{channel_id}.{os.getpid()}.{int(time.time() * 1000)}"
+    write_run(run_id, server=str(guild_id or ""), channel=str(channel_id),
+              user=str(author), model=CLAUDE_MODEL or "default", effort=CLAUDE_EFFORT or "default",
+              start=time.time(), status="starting", phase="starting", thinking="")
+
     def invoke(resume_id):
         cmd = list(base)
         if resume_id:
             cmd.extend(["--resume", resume_id])
         cmd.append(instruction)
+        if STREAM_TELEMETRY:
+            return _stream_claude(cmd, server_dir, sub_env, run_id)
         return subprocess.run(
-            cmd,
-            cwd=server_dir,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=TIMEOUT_SECONDS,
-            env=sub_env,
+            cmd, cwd=server_dir, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=TIMEOUT_SECONDS, env=sub_env,
         )
 
-    resume_id = get_session(channel_id) if SESSION_RESUME else None
-    result = invoke(resume_id)
-    # The stored session can go missing (e.g. config dir reset) — retry fresh.
-    if result.returncode != 0 and resume_id:
-        print(f"[bridge] resume failed for {channel_id}; starting a fresh session", flush=True)
-        clear_session(channel_id)
-        result = invoke(None)
+    try:
+        resume_id = get_session(channel_id) if SESSION_RESUME else None
+        result = invoke(resume_id)
+        # The stored session can go missing (e.g. config dir reset) — retry fresh.
+        if result.returncode != 0 and resume_id:
+            print(f"[bridge] resume failed for {channel_id}; starting a fresh session", flush=True)
+            clear_session(channel_id)
+            result = invoke(None)
 
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout).strip()
-        # If claude emitted a JSON error (e.g. rate limit), surface just its message.
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout).strip()
+            try:
+                edata = json.loads(err)
+                err = edata.get("result") or edata.get("error") or err
+            except Exception:
+                pass
+            if _looks_rate_limited(err):
+                reset = parse_reset_epoch(err)
+                set_limited(reset)
+                raise RateLimited(reset)
+            return f"⚠️ {err[:MAX_RESPONSE_CHARS]}"
+
         try:
-            edata = json.loads(err)
-            err = edata.get("result") or edata.get("error") or err
+            data = json.loads(result.stdout or "{}")
         except Exception:
-            pass
-        if _looks_rate_limited(err):
-            reset = parse_reset_epoch(err)
+            return (result.stdout or "").strip() or "Claude returned no output."
+        # A 0-exit result can still be a rate-limit error (is_error + 429).
+        if data.get("is_error") and (data.get("api_error_status") == 429 or _looks_rate_limited(data.get("result"))):
+            reset = parse_reset_epoch(data.get("result"))
             set_limited(reset)
             raise RateLimited(reset)
-        return f"⚠️ {err[:MAX_RESPONSE_CHARS]}"
-
-    try:
-        data = json.loads(result.stdout or "{}")
-    except Exception:
-        return (result.stdout or "").strip() or "Claude returned no output."
-    # A 0-exit result can still be a rate-limit error (is_error + 429).
-    if data.get("is_error") and (data.get("api_error_status") == 429 or _looks_rate_limited(data.get("result"))):
-        reset = parse_reset_epoch(data.get("result"))
-        set_limited(reset)
-        raise RateLimited(reset)
-    if SESSION_RESUME and data.get("session_id"):
-        set_session(channel_id, data["session_id"])
-    log_usage(channel_id, author, data)
-    # Full reply — post_reply() chunks/uploads it instead of truncating.
-    return (data.get("result") or "").strip() or "Claude returned no output."
+        if SESSION_RESUME and data.get("session_id"):
+            set_session(channel_id, data["session_id"])
+        log_usage(channel_id, author, data)
+        # Full reply — post_reply() chunks/uploads it instead of truncating.
+        return (data.get("result") or "").strip() or "Claude returned no output."
+    finally:
+        clear_run(run_id)
 
 
 def handle_message(channel_id, msg):
@@ -858,6 +1329,8 @@ def handle_message(channel_id, msg):
     if not claim_message(msg["id"]):
         return  # already handled by the other path (poller/gateway)
     react(channel_id, msg["id"], "👀")  # instant ack: "seen you"
+    # Which server this is in (gateway events carry guild_id; poller uses the map).
+    guild_id = msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id))
     prompt = clean_prompt(content)
     low = prompt.strip().lower()
     # Built-in commands (no Claude run).
@@ -869,7 +1342,7 @@ def handle_message(channel_id, msg):
         post_reply(channel_id, HELP_TEXT, mention_user_id=author_id)
         return
     if low in ("/status", "status"):
-        post_reply(channel_id, build_status(), mention_user_id=author_id)
+        post_reply(channel_id, build_status(guild_id), mention_user_id=author_id)
         return
     # Pull in any attached images/files so Claude can read them.
     try:
@@ -896,14 +1369,6 @@ def handle_message(channel_id, msg):
         f"from {author.get('username', author_id)}",
         flush=True,
     )
-    # Ack with a 👀 reaction so the sender immediately sees we picked it up — this
-    # replaces the old "typing for the entire run" indicator. The live "working"
-    # signal is now this reaction plus the progress posts Mochi makes itself; the
-    # typing indicator is reserved for the moment we actually post the answer.
-    react(channel_id, msg["id"], "👀")
-    # Which server this is in, so handling stays scoped to it (gateway events carry
-    # guild_id; REST poller messages don't, so fall back to the channel→guild map).
-    guild_id = msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id))
     reply = "Bridge error."
     try:
         # Serialize same-channel messages so they continue one conversation in
@@ -933,8 +1398,12 @@ def handle_message(channel_id, msg):
         # writing it out, then post and swap the 👀 ack for a ✅ done mark.
         _typing_burst(channel_id, len(reply))
     post_reply(channel_id, reply, mention_user_id=author_id)
-    unreact(channel_id, msg["id"], "👀")
-    react(channel_id, msg["id"], "✅")
+    # Swap the working ack for a done mark. Add ✅ FIRST and only drop the 👀
+    # once ✅ is confirmed — so a transient failure leaves the 👀 standing
+    # rather than a bare, ack-less message (the M1·IR audit reply hit exactly
+    # this: ✅ never landed and 👀 was already gone → looked like nothing ran).
+    if react(channel_id, msg["id"], "✅"):
+        unreact(channel_id, msg["id"], "👀")
 
 
 def main():
@@ -958,10 +1427,22 @@ def main():
                     save_cursors(cursors)
                     continue
                 messages = fetch_messages(channel_id, cursors[channel_id])
+                human_activity = False
                 for msg in messages:
                     cursors[channel_id] = msg["id"]
                     save_cursors(cursors)
+                    if (msg.get("author") or {}).get("id") != BOT_ID:
+                        human_activity = True
                     handle_message(channel_id, msg)
+                if human_activity:
+                    _touch_activity()
+                # Marked-deletion sweep: only when this channel saw activity, or a
+                # coarse fallback so a 🗑️ on a quiet channel is still caught. No
+                # more scanning every channel every tick.
+                now = time.time()
+                if messages or (now - _LAST_MARK_SWEEP.get(channel_id, 0.0) >= MARK_SWEEP_FALLBACK):
+                    sweep_marked_deletions(channel_id)
+                    _LAST_MARK_SWEEP[channel_id] = now
             except Exception as exc:
                 print(f"[bridge] error in {channel_id}: {exc}", flush=True)
         time.sleep(TICK_SECONDS)
