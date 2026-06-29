@@ -37,6 +37,7 @@ load_dotenv(os.path.join(WORKSPACE, ".env"), override=True)
 WORKERS = int(os.environ.get("GATEWAY_WORKERS", "4"))
 SESSIONS_FILE = os.path.join(WORKSPACE, ".sessions.json")
 SERVERS_DIR = os.path.join(WORKSPACE, "servers")
+SUBAGENTS_DIR = os.path.join(WORKSPACE, "subagents")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 PHASE_STYLE = {"💭 thinking": "yellow", "✍️ replying": "green", "done": "dim", "starting": "cyan"}
@@ -210,6 +211,66 @@ def recent():
     return t
 
 
+def _tmux_alive(name):
+    try:
+        return subprocess.run(["tmux", "has-session", "-t", f"sa-{name}"],
+                              capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+
+def subagents():
+    """Background tmux sub-agents tracked under /workspace/subagents/: running
+    (tmux session alive), done (exit marker), or stopped. Running first."""
+    out = []
+    for f in glob.glob(os.path.join(SUBAGENTS_DIR, "*.json")):
+        d = _json(f, None)
+        if not d:
+            continue
+        name = d.get("name") or os.path.basename(f)[:-5]
+        exit_f = os.path.join(SUBAGENTS_DIR, name + ".exit")
+        if os.path.exists(exit_f):
+            try:
+                code = open(exit_f).read().strip()
+            except Exception:
+                code = "?"
+            status, running = f"done · exit {code}", False
+        elif _tmux_alive(name):
+            status, running = "running", True
+        else:
+            status, running = "stopped", False
+        out.append({"name": name, "status": status, "running": running,
+                    "channel": d.get("channel"), "started": d.get("started_at"),
+                    "note": d.get("note") or "", "report": d.get("report")})
+    # Keep all running; drop finished/stopped ones older than a day so the panel
+    # stays focused on what's actually current.
+    now = time.time()
+    out = [s for s in out if s["running"] or (now - (s.get("started") or 0) < 86400)]
+    out.sort(key=lambda s: (not s["running"], -(s.get("started") or 0)))
+    return out
+
+
+def subagents_panel(subs):
+    t = Table.grid(padding=(0, 1))
+    for _ in range(4):
+        t.add_column()
+    for s in subs[:7]:
+        el = _dur(time.time() - s["started"]) if s.get("started") else "?"
+        cname = channel_info(s["channel"])[0] if s.get("channel") else "—"
+        if s["running"]:
+            dot = "[green]●[/]"
+        elif s["status"].endswith("exit 0"):
+            dot = "[dim]●[/]"
+        else:
+            dot = "[red]●[/]"
+        rep = " [dim]→ch[/]" if s.get("report") else ""
+        t.add_row(dot, f"[bold]{_short(s['name'], 16)}[/]",
+                  f"[dim]{s['status']}[/]   [dim]#{_short(cname, 14)} · {el}{rep}[/]")
+    nrun = sum(1 for s in subs if s["running"])
+    return Panel(t, title=f"sub-agents (background) — {nrun} running",
+                 border_style="blue", padding=(0, 1))
+
+
 def resumable():
     """Resumable per-channel sessions (skip the internal sweep sessions)."""
     d = _json(SESSIONS_FILE, {})
@@ -268,6 +329,9 @@ def dashboard(sess=None):
         mid = Panel(Text("idle — no agents running right now", style="dim italic"),
                     border_style="dim", padding=(0, 1))
     parts = [overview(runs), mid]
+    subs = subagents()
+    if subs:
+        parts.append(subagents_panel(subs))
     if sess is not None:
         parts.append(sessions_panel(sess))
     parts.append(recent())
