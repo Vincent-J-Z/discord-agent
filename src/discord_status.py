@@ -23,14 +23,17 @@ txt = (open(MD).read().rstrip() + f"\n🕐 **更新于 {_now}**(每分钟刷新)
 mid = open(IDF).read().strip() if os.path.exists(IDF) else ""
 payload = {"content": txt, "allowed_mentions": {"parse": []}}
 
-if mid:
-    r = httpx.patch(f"{BASE}/{mid}", json=payload, headers=H, timeout=20)
-    if r.status_code == 200:
-        raise SystemExit  # silent on routine success — no per-tick log spam
-# first time, or the message was deleted -> post a fresh one
-r = httpx.post(BASE, json=payload, headers=H, timeout=20)
-if r.status_code in (200, 201):
-    open(IDF, "w").write(str(r.json()["id"]))
-    print("status posted", r.json()["id"])
-else:
-    print("status ERR", r.status_code, r.text[:200])
+try:
+    if mid:
+        r = httpx.patch(f"{BASE}/{mid}", json=payload, headers=H, timeout=20)
+        if r.status_code == 200:
+            raise SystemExit  # silent on routine success — no per-tick log spam
+    # first time, or the message was deleted -> post a fresh one
+    r = httpx.post(BASE, json=payload, headers=H, timeout=20)
+    if r.status_code in (200, 201):
+        open(IDF, "w").write(str(r.json()["id"]))
+        print("status posted", r.json()["id"])
+    else:
+        print("status ERR", r.status_code, r.text[:200])
+except Exception as e:
+    print("status net err:", str(e)[:120])  # transient blip — don't traceback-spam

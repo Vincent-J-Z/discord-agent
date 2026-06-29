@@ -126,6 +126,11 @@ HANDLED_DIR = os.path.join(WORKSPACE, ".handled")
 # across container rebuilds). Send "/reset" in a channel to start fresh there.
 SESSIONS_FILE = os.path.join(WORKSPACE, ".sessions.json")
 SESSION_RESUME = os.environ.get("SESSION_RESUME", "1").strip().lower() not in ("0", "", "false", "no")
+# Per-channel context watermark: the id of the last message the bot's session has
+# seen. Lets us inject ONLY new messages since the bot's last turn (the gap the
+# session doesn't have) instead of re-feeding a fixed window every time.
+CONTEXT_CURSORS_FILE = os.path.join(WORKSPACE, ".context_cursors.json")
+_ctx_lock = threading.Lock()
 # Discord channel types we treat as text we can be summoned in.
 TEXT_CHANNEL_TYPES = {0, 5, 10, 11, 12}
 # Tier-1: reply chunking, attachments, usage tracking.
@@ -416,6 +421,39 @@ def clear_session(channel_id):
             os.replace(tmp, SESSIONS_FILE)
 
 
+def _read_ctx():
+    try:
+        with open(CONTEXT_CURSORS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_context_cursor(channel_id):
+    return _read_ctx().get(str(channel_id))
+
+
+def set_context_cursor(channel_id, message_id):
+    with _ctx_lock:
+        d = _read_ctx()
+        d[str(channel_id)] = str(message_id)
+        tmp = CONTEXT_CURSORS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, CONTEXT_CURSORS_FILE)
+
+
+def clear_context_cursor(channel_id):
+    with _ctx_lock:
+        d = _read_ctx()
+        if d.pop(str(channel_id), None) is not None:
+            tmp = CONTEXT_CURSORS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(d, f)
+            os.replace(tmp, CONTEXT_CURSORS_FILE)
+
+
 def channel_lock(channel_id):
     with _channel_locks_guard:
         lk = _channel_locks.get(str(channel_id))
@@ -468,6 +506,28 @@ def _fetch_before(channel_id, before_id, want):
             if len(batch) < page:
                 break
     return sorted(out, key=lambda m: int(m["id"]))  # oldest-first
+
+
+def _fetch_after(channel_id, after_id, want):
+    """Fetch up to `want` messages strictly AFTER `after_id`, oldest-first."""
+    out = []
+    cursor = after_id
+    with httpx.Client(timeout=20, headers=HEADERS) as client:
+        while len(out) < want:
+            page = min(100, want - len(out))
+            response = client.get(
+                f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                params={"limit": page, "after": cursor},
+            )
+            response.raise_for_status()
+            batch = response.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            out.extend(batch)
+            cursor = max(batch, key=lambda m: int(m["id"]))["id"]
+            if len(batch) < page:
+                break
+    return sorted(out, key=lambda m: int(m["id"]))
 
 
 def _reacted_with(msg, emoji):
@@ -668,6 +728,40 @@ def fetch_recent(channel_id, before_id):
             return _fetch_recent_flat(channel_id, before_id)
         except Exception:
             return ""
+
+
+def build_context(channel_id, before_id):
+    """Context to feed the model. With a live session + a known watermark, inject
+    ONLY the messages that arrived since the bot's last turn — the gap the session
+    doesn't already have — so nothing is missed and nothing is re-fed. Otherwise
+    (first message / no session / no watermark) seed the normal recent window.
+    Never raises: falls back to the window on any error."""
+    cursor = get_context_cursor(channel_id)
+    if SESSION_RESUME and cursor and get_session(channel_id):
+        try:
+            gap = [
+                m for m in _fetch_after(channel_id, cursor, HISTORY_DEEP)
+                if int(m["id"]) < int(before_id)
+                and (m.get("author") or {}).get("id") != BOT_ID
+            ]
+            gap = _drop_marked(gap)
+            if not gap:
+                return ""  # nothing new since last reply — the session has it all
+            if COMPACT_HISTORY and HISTORY_VERBATIM > 0 and len(gap) > HISTORY_LIMIT:
+                older, tail = gap[:-HISTORY_VERBATIM], gap[-HISTORY_VERBATIM:]
+                summary = _compact_summary(channel_id, older)
+                head = f"[Summary of activity since your last reply]\n{summary}\n\n" if summary else ""
+                body = head + "\n".join(filter(None, (_msg_line(m) for m in tail)))
+            else:
+                body = "\n".join(filter(None, (_msg_line(m) for m in gap)))
+            body = body.strip()
+            return (
+                "New messages in this channel since your last reply "
+                f"(you haven't seen these yet):\n{body}"
+            ) if body else ""
+        except Exception as exc:
+            print(f"[bridge] incremental context failed for {channel_id}: {exc}", flush=True)
+    return fetch_recent(channel_id, before_id)
 
 
 def fetch_latest_id(channel_id):
@@ -1446,6 +1540,7 @@ def handle_message(channel_id, msg):
     # Built-in commands (no Claude run).
     if low in ("/reset", "/new", "reset session"):
         clear_session(channel_id)
+        clear_context_cursor(channel_id)
         post(channel_id, "🔄 已重置本频道的会话,下一条消息从头开始。", mention_user_id=reply_mention)
         return
     if low in ("/help", "help"):
@@ -1494,12 +1589,15 @@ def handle_message(channel_id, msg):
         # order; different channels still run concurrently.
         with channel_lock(channel_id):
             try:
-                history = fetch_recent(channel_id, msg["id"])
+                history = build_context(channel_id, msg["id"])
             except Exception as exc:
                 print(f"[bridge] history fetch failed: {exc}", flush=True)
                 history = ""
             try:
                 reply = run_claude(author.get("username", author_id), channel_id, prompt, history, guild_id)
+                # The session now knows up to this message — next turn injects only
+                # what arrives after it (no re-feeding, no gaps).
+                set_context_cursor(channel_id, msg["id"])
             except RateLimited as rl:
                 # Hit the limit mid-flight — queue it and tell the user it'll auto-resume.
                 defer_message(channel_id, msg, prompt)

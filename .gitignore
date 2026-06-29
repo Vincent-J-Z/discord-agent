@@ -17,6 +17,7 @@ __pycache__/
 .bridge_cursors.json
 .sessions.json
 .namecache.json
+.context_cursors.json
 .discord_voice_on
 .status_msg_id
 .status.md
