@@ -1162,6 +1162,7 @@ def defer_message(channel_id, msg, prompt):
         "message_id": str(msg["id"]),
         "author_id": author.get("id"),
         "author": author.get("username"),
+        "is_bot": bool(author.get("bot")) and author.get("id") != BOT_ID,
         "guild_id": msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id)),
         "prompt": prompt,
     }
@@ -1184,45 +1185,59 @@ def list_deferred():
 
 
 def drain_deferred():
-    """Re-answer queued requests after the limit resets, oldest first. Stops (and
-    keeps the rest) if we get rate-limited again."""
+    """After the limit resets, do ONE coherent catch-up per channel — read the
+    backlog (via the context window) and respond to the current state, addressing
+    open items one at a time — rather than replaying every stale message. Stops
+    (keeping the rest) if we get rate-limited again."""
+    groups = {}
     for path in list_deferred():
-        if is_limited():
-            return
         try:
             with open(path) as f:
                 rec = json.load(f)
+            rec["_path"] = path
+            groups.setdefault(rec["channel_id"], []).append(rec)
         except Exception:
             try:
                 os.remove(path)
             except OSError:
                 pass
-            continue
-        ch = rec["channel_id"]
+    for ch, recs in groups.items():
+        if is_limited():
+            return  # still limited — leave the rest for next time
+        recs.sort(key=lambda r: int(r.get("message_id") or 0))
+        latest = recs[-1]
+        catchup = (
+            "[You were rate-limited and just came back online. The recent channel "
+            "activity is in your context — catch up on what happened while you were "
+            "out and respond to what currently needs you, one item at a time. Do "
+            "NOT reply to each old message separately, and do NOT @ other bots just "
+            "to acknowledge.]\n\n" + (latest.get("prompt") or "")
+        )
         try:
             with channel_lock(ch):
-                reply = run_claude(rec.get("author") or "user", ch, rec.get("prompt") or "",
-                                   guild_id=rec.get("guild_id"))
+                reply = run_claude(latest.get("author") or "user", ch, catchup,
+                                   guild_id=latest.get("guild_id"))
         except RateLimited:
-            return  # still limited — leave this and the rest for next time
+            return
         except subprocess.TimeoutExpired:
-            reply = f"⏱️ 这条排队任务超过 {TIMEOUT_SECONDS // 60} 分钟上限,被中断。"
+            reply = f"⏱️ 排队的任务超过 {TIMEOUT_SECONDS // 60} 分钟上限,被中断。"
         except Exception as exc:
             reply = f"Bridge error: {exc}"
+        # Don't @ a bot author on resume either (avoid re-triggering the loop); the
+        # reply itself can mention a specific bot if Mochi decides it's needed.
+        mention = None if latest.get("is_bot") else latest.get("author_id")
         try:
-            post_reply(ch, reply, mention_user_id=rec.get("author_id"))
-            # Mark the original message done, same as the live path: add ✅ then
-            # clear the waiting acks (⏳ from deferral, 👀 from receipt). Without
-            # this a resumed-from-queue task stayed stuck on ⏳ forever.
-            mid = rec.get("message_id")
+            post_reply(ch, reply, mention_user_id=mention)
+            mid = latest.get("message_id")
             if mid and react(ch, mid, "✅"):
                 unreact(ch, mid, "⏳")
                 unreact(ch, mid, "👀")
         finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            for r in recs:  # clear the whole channel's queue (handled in one pass)
+                try:
+                    os.remove(r["_path"])
+                except OSError:
+                    pass
 
 
 def ensure_server_dir(guild_id):
@@ -1571,12 +1586,16 @@ def handle_message(channel_id, msg):
             "actionable. If not, reply with a single short line and do NOT ask "
             "questions back. Keep it brief.]\n\n" + prompt
         )
-    # Rate-limited right now → don't waste a call; queue it and auto-answer on reset.
+    # Rate-limited right now → don't waste a call; queue it and answer on reset.
     if is_limited():
         defer_message(channel_id, msg, prompt)
         react(channel_id, msg["id"], "⏳")
-        post(channel_id, f"⏳ Claude 额度暂时用满,约 {fmt_utc(limited_until())} 恢复后我会自动回复你。",
-             mention_user_id=reply_mention)
+        # NEVER @ another bot with the limited notice — that pings it, it pings
+        # back, and we're in an infinite "out of quota" ping-pong. Bots just get the
+        # silent ⏳; humans get told to wait.
+        if not is_bot_author:
+            post(channel_id, f"⏳ Claude 额度暂时用满,约 {fmt_utc(limited_until())} 恢复后我会自动回复你。",
+                 mention_user_id=reply_mention)
         return
     print(
         f"[bridge] handling {msg['id']} in {channel_id} "
