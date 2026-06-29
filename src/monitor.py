@@ -15,6 +15,7 @@ import json
 import os
 import time
 
+import httpx
 from dotenv import load_dotenv
 from rich.columns import Columns
 from rich.console import Console, Group
@@ -30,6 +31,58 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 load_dotenv(os.path.join(WORKSPACE, ".env"), override=True)
 WORKERS = int(os.environ.get("GATEWAY_WORKERS", "4"))
 PHASE_STYLE = {"💭 thinking": "yellow", "✍️ replying": "green", "done": "dim", "starting": "cyan"}
+
+# Resolve guild/channel ids → human names via the bot token, cached to disk so we
+# don't hit the API on every refresh (names rarely change).
+_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+_NAME_CACHE_FILE = os.path.join(WORKSPACE, ".namecache.json")
+try:
+    with open(_NAME_CACHE_FILE) as _f:
+        _names = json.load(_f)
+except Exception:
+    _names = {}
+
+
+def _api(path):
+    try:
+        r = httpx.get("https://discord.com/api/v10" + path,
+                      headers={"Authorization": f"Bot {_TOKEN}"}, timeout=6)
+        return r.json() if r.status_code == 200 else {}
+    except Exception:
+        return {}
+
+
+def _save_names():
+    try:
+        with open(_NAME_CACHE_FILE, "w") as f:
+            json.dump(_names, f)
+    except Exception:
+        pass
+
+
+def guild_name(gid):
+    gid = str(gid or "")
+    if not gid:
+        return "?"
+    k = "g:" + gid
+    if k not in _names:
+        _names[k] = (_api(f"/guilds/{gid}").get("name") or gid[:8])
+        _save_names()
+    return _names[k]
+
+
+def channel_info(cid):
+    """→ (channel_name, guild_id). Cached."""
+    cid = str(cid or "")
+    if not cid:
+        return "?", ""
+    k = "c:" + cid
+    if k not in _names:
+        d = _api(f"/channels/{cid}")
+        _names[k] = {"name": d.get("name") or cid[:8], "guild": str(d.get("guild_id") or "")}
+        _save_names()
+    v = _names[k]
+    return v["name"], v["guild"]
 
 
 def _json(path, default):
@@ -125,7 +178,8 @@ def agent_panel(d):
     el = _dur(now - (d.get("start") or now))
     think = (d.get("thinking") or "").strip() or "…"
     head = Text.assemble(("● ", style), (phase, f"bold {style}"), ("   ", ""), (el, "dim"))
-    meta = Text(f"{_short(d.get('server', '?'), 18)} · #{_short(d.get('channel', '?'), 18)} · "
+    cname, _gid = channel_info(d.get("channel"))
+    meta = Text(f"{_short(guild_name(d.get('server')), 16)} · #{_short(cname, 18)} · "
                 f"{_short(d.get('user', '?'), 14)}", style="dim cyan")
     body = Text(think[-360:], style="dim")
     return Panel(Group(head, meta, Text(""), body), border_style=style,
@@ -135,12 +189,14 @@ def agent_panel(d):
 def recent():
     u = _usage()
     t = Table(title="recent runs", expand=True, border_style="dim", title_style="bold dim")
-    t.add_column("channel")
+    t.add_column("server / channel")
     t.add_column("cost", justify="right")
     t.add_column("turns", justify="right")
     t.add_column("dur", justify="right")
     for r in list(reversed(u))[:6]:
-        t.add_row(_short(r.get("channel"), 22), f"${(r.get('cost_usd') or 0):.4f}",
+        cname, gid = channel_info(r.get("channel"))
+        loc = f"{_short(guild_name(gid), 12)}/#{_short(cname, 16)}"
+        t.add_row(loc, f"${(r.get('cost_usd') or 0):.4f}",
                   str(r.get("turns") or "?"), f"{(r.get('duration_ms') or 0) // 1000}s")
     return t
 

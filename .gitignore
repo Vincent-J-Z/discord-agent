@@ -16,6 +16,7 @@ __pycache__/
 .claude_bridge_seen
 .bridge_cursors.json
 .sessions.json
+.namecache.json
 .discord_voice_on
 .status_msg_id
 .status.md

@@ -10,6 +10,7 @@ the agent can edit its own code when a session asks it to; edits land on the
 host bind mount.
 """
 import datetime
+import difflib
 import json
 import os
 import re
@@ -150,6 +151,34 @@ HELP_TEXT = (
 
 allowed_raw = os.environ.get("BOT_ALLOWED_USER_IDS", "").strip()
 ALLOWED_USER_IDS = {x.strip() for x in allowed_raw.split(",") if x.strip()}
+
+# Anti-loop for bot↔bot @-mention ping-pong. Discord marks bot/webhook authors
+# with author.bot == true, so we can tell them apart from humans.
+#
+# Whether to keep replying to a bot is judged by PROGRESS, not by a round count —
+# a long genuine task may need many back-and-forth turns and must NOT be cut off
+# just for being long. Two independent gates decide:
+#   (a) Content classifier (cheap model): is the latest bot message real,
+#       actionable work, or idle chatter / no-progress filler? Chatter → react
+#       only. This naturally allows arbitrarily long collaboration AS LONG AS work
+#       is happening, and goes quiet the moment it degrades into pleasantries.
+#   (b) Stall/repetition detector: the real "stuck loop" signature is bots
+#       echoing near-identical messages. If the last BOT_STALL_MAX bot turns are
+#       near-duplicates (ratio ≥ BOT_REPEAT_RATIO) we break; ANY novel/progressing
+#       message resets the stall counter. So varied, advancing work never trips it.
+# BOT_REPLY_MAX is ONLY a catastrophic token-burn ceiling (set high; real
+# collaboration shouldn't reach it). A human message resets all per-channel state.
+#   REPLY_TO_BOTS=0  → never reply to bots (react-only).
+#   BOT_JUDGE=0      → skip the content classifier (stall detector still applies).
+REPLY_TO_BOTS = os.environ.get("REPLY_TO_BOTS", "1").strip().lower() not in ("0", "", "false", "no")
+BOT_JUDGE = os.environ.get("BOT_JUDGE", "1").strip().lower() not in ("0", "", "false", "no")
+BOT_STALL_MAX = int(os.environ.get("BOT_STALL_MAX", "4"))      # consecutive repeats → stop
+BOT_REPEAT_RATIO = float(os.environ.get("BOT_REPEAT_RATIO", "0.985"))  # near-verbatim only
+BOT_REPLY_MAX = int(os.environ.get("BOT_REPLY_MAX", "40"))     # catastrophic ceiling only
+BOT_ACK_EMOJI = os.environ.get("BOT_ACK_EMOJI", "🤖")
+_bot_reply_streak = {}   # channel_id -> consecutive replies to bot authors (ceiling)
+_bot_recent_msgs = {}    # channel_id -> recent normalized bot message texts
+_bot_stall = {}          # channel_id -> consecutive near-duplicate bot turns
 
 HEADERS = {"Authorization": f"Bot {TOKEN}"}
 POST_HEADERS = {**HEADERS, "Content-Type": "application/json"}
@@ -539,6 +568,35 @@ def _small_model_summary(prompt):
     except Exception as exc:
         print(f"[bridge] compact summarize failed: {exc}", flush=True)
         return ""
+
+
+def _bot_should_engage(latest_text, history=""):
+    """Content-based gate for bot↔bot messages: should we actually reply, or is
+    this idle chatter / a no-progress loop we should let die (react only)?
+
+    Uses the cheap model, tools disabled. Returns True (engage) / False (skip).
+    Fails OPEN (True) on any error — the BOT_REPLY_MAX safety cap still bounds a
+    runaway, so a flaky classifier never silently swallows real work."""
+    snippet = (latest_text or "").strip()[:1500]
+    ctx = (history or "")[-2000:]
+    prompt = (
+        "You gate a Discord bot's replies to messages from ANOTHER BOT, to stop "
+        "two bots from @-pinging each other forever. Judge ONLY the latest bot "
+        "message (with the recent context) and decide:\n"
+        "- ENGAGE: it asks for or advances REAL work — a concrete request, data, "
+        "a question that needs answering, a task hand-off, an error to fix, etc.\n"
+        "- SKIP: it's filler with no actionable content — thanks/acknowledgements, "
+        "pleasantries, 'ok'/'收到', restating what's done, or an echo that adds "
+        "nothing and would just keep the loop going.\n"
+        "When the exchange has clearly stopped making progress, choose SKIP.\n\n"
+        f"--- recent context ---\n{ctx}\n\n"
+        f"--- latest bot message ---\n{snippet}\n\n"
+        "Answer with EXACTLY one word: ENGAGE or SKIP."
+    )
+    verdict = _small_model_summary(prompt)
+    if not verdict:
+        return True  # fail open; safety cap bounds the worst case
+    return "SKIP" not in verdict.strip().upper()
 
 
 def _compact_summary(channel_id, older):
@@ -1328,6 +1386,58 @@ def handle_message(channel_id, msg):
         return
     if not claim_message(msg["id"]):
         return  # already handled by the other path (poller/gateway)
+    # Distinguish humans from bots/webhooks (Discord sets author.bot). A human
+    # message clears the bot-loop streak; a bot message goes through the anti-loop
+    # guard so two bots can't @-pingpong forever.
+    is_bot_author = bool(author.get("bot")) and author_id != BOT_ID
+    cid = str(channel_id)
+    if is_bot_author:
+        streak = _bot_reply_streak.get(cid, 0)
+        # 1) Catastrophic ceiling only (token-burn breaker / bots disabled). Real
+        #    collaboration shouldn't reach it; the progress gates below do the work.
+        if not REPLY_TO_BOTS or BOT_REPLY_MAX <= 0 or streak >= BOT_REPLY_MAX:
+            react(channel_id, msg["id"], BOT_ACK_EMOJI)
+            print(f"[bridge] bot ceiling in {channel_id} (streak={streak}); react-only",
+                  flush=True)
+            return
+        # 2) Stall/repetition detector — the real loop signature. Near-duplicate
+        #    bot turns pile up a stall count; any novel/progressing message resets
+        #    it, so a genuinely advancing task (varied content) is never cut off
+        #    no matter how many turns it takes.
+        norm = WS_RE.sub(" ", content.lower()).strip()
+        recent = _bot_recent_msgs.get(cid, [])
+        rep = max((difflib.SequenceMatcher(None, norm, r).ratio() for r in recent), default=0.0)
+        stall = _bot_stall.get(cid, 0) + 1 if (norm and rep >= BOT_REPEAT_RATIO) else 0
+        _bot_stall[cid] = stall
+        _bot_recent_msgs[cid] = (recent + [norm])[-6:]
+        if BOT_STALL_MAX > 0 and stall >= BOT_STALL_MAX:
+            react(channel_id, msg["id"], BOT_ACK_EMOJI)
+            print(f"[bridge] bot stuck/repeating in {channel_id} (stall={stall}); react-only",
+                  flush=True)
+            return
+        # 3) Content judgment: engage only if the bot message is genuine work; if
+        #    it's idle chatter / no-progress filler, just react and let it die.
+        if BOT_JUDGE:
+            try:
+                hist = "\n".join(filter(None, (
+                    _msg_line(m) for m in _fetch_before(channel_id, msg["id"], 6))))
+            except Exception:
+                hist = ""
+            if not _bot_should_engage(content, hist):
+                react(channel_id, msg["id"], BOT_ACK_EMOJI)
+                print(f"[bridge] bot msg judged chatter in {channel_id}; react-only",
+                      flush=True)
+                return
+        _bot_reply_streak[cid] = streak + 1
+    else:
+        _bot_reply_streak.pop(cid, None)
+        _bot_stall.pop(cid, None)
+        _bot_recent_msgs.pop(cid, None)
+    # We DO @ the bot back when engaging — the other bot needs the mention to be
+    # triggered, so real back-and-forth collaboration can continue. The loop is
+    # broken by the content judgment above (chatter → we post nothing, just react)
+    # plus the BOT_REPLY_MAX safety cap, NOT by withholding the @.
+    reply_mention = author_id
     react(channel_id, msg["id"], "👀")  # instant ack: "seen you"
     # Which server this is in (gateway events carry guild_id; poller uses the map).
     guild_id = msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id))
@@ -1336,13 +1446,13 @@ def handle_message(channel_id, msg):
     # Built-in commands (no Claude run).
     if low in ("/reset", "/new", "reset session"):
         clear_session(channel_id)
-        post(channel_id, "🔄 已重置本频道的会话,下一条消息从头开始。", mention_user_id=author_id)
+        post(channel_id, "🔄 已重置本频道的会话,下一条消息从头开始。", mention_user_id=reply_mention)
         return
     if low in ("/help", "help"):
-        post_reply(channel_id, HELP_TEXT, mention_user_id=author_id)
+        post_reply(channel_id, HELP_TEXT, mention_user_id=reply_mention)
         return
     if low in ("/status", "status"):
-        post_reply(channel_id, build_status(guild_id), mention_user_id=author_id)
+        post_reply(channel_id, build_status(guild_id), mention_user_id=reply_mention)
         return
     # Pull in any attached images/files so Claude can read them.
     try:
@@ -1357,12 +1467,21 @@ def handle_message(channel_id, msg):
         )
     if not prompt:
         prompt = "The user only mentioned you without extra text. Reply briefly and ask what they need."
+    if is_bot_author:
+        # Let Claude apply its own judgment on top of the hard cap: this came from
+        # another bot, so wind the exchange down unless there's real work to do.
+        prompt = (
+            "[This @-mention is from ANOTHER BOT, not a human. To avoid an endless "
+            "bot-to-bot loop: only respond if there is something genuinely "
+            "actionable. If not, reply with a single short line and do NOT ask "
+            "questions back. Keep it brief.]\n\n" + prompt
+        )
     # Rate-limited right now → don't waste a call; queue it and auto-answer on reset.
     if is_limited():
         defer_message(channel_id, msg, prompt)
         react(channel_id, msg["id"], "⏳")
         post(channel_id, f"⏳ Claude 额度暂时用满,约 {fmt_utc(limited_until())} 恢复后我会自动回复你。",
-             mention_user_id=author_id)
+             mention_user_id=reply_mention)
         return
     print(
         f"[bridge] handling {msg['id']} in {channel_id} "
@@ -1397,7 +1516,7 @@ def handle_message(channel_id, msg):
         # Now we have the answer — show "typing…" briefly so it looks like we're
         # writing it out, then post and swap the 👀 ack for a ✅ done mark.
         _typing_burst(channel_id, len(reply))
-    post_reply(channel_id, reply, mention_user_id=author_id)
+    post_reply(channel_id, reply, mention_user_id=reply_mention)
     # Swap the working ack for a done mark. Add ✅ FIRST and only drop the 👀
     # once ✅ is confirmed — so a transient failure leaves the 👀 standing
     # rather than a bare, ack-less message (the M1·IR audit reply hit exactly
