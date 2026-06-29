@@ -13,7 +13,12 @@ tool-use. Bottom: recent completed runs. Ctrl-C to quit.
 import glob
 import json
 import os
+import select
+import subprocess
+import sys
+import termios
 import time
+import tty
 
 import httpx
 from dotenv import load_dotenv
@@ -30,6 +35,10 @@ RUNS_DIR = os.path.join(WORKSPACE, ".runs")
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 load_dotenv(os.path.join(WORKSPACE, ".env"), override=True)
 WORKERS = int(os.environ.get("GATEWAY_WORKERS", "4"))
+SESSIONS_FILE = os.path.join(WORKSPACE, ".sessions.json")
+SERVERS_DIR = os.path.join(WORKSPACE, "servers")
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 PHASE_STYLE = {"💭 thinking": "yellow", "✍️ replying": "green", "done": "dim", "starting": "cyan"}
 
 # Resolve guild/channel ids → human names via the bot token, cached to disk so we
@@ -201,24 +210,117 @@ def recent():
     return t
 
 
-def dashboard():
+def resumable():
+    """Resumable per-channel sessions (skip the internal sweep sessions)."""
+    d = _json(SESSIONS_FILE, {})
+    return [{"channel": ch, "sid": sid} for ch, sid in d.items() if not ch.startswith("__")][:9]
+
+
+def sessions_panel(sess):
+    t = Table.grid(padding=(0, 1))
+    t.add_column(style="bold magenta", justify="right")
+    t.add_column()
+    for i, s in enumerate(sess, 1):
+        cname, gid = channel_info(s["channel"])
+        t.add_row(f"{i}", f"{_short(guild_name(gid), 14)} · #{_short(cname, 18)}  "
+                          f"[dim]{s['sid'][:8]}[/]")
+    if not sess:
+        t.add_row("", "[dim](no sessions yet)[/]")
+    return Panel(t, title="resume & chat — press [1-9]   ·   q quit",
+                 border_style="magenta", padding=(0, 1))
+
+
+def _channel_busy(channel):
+    for f in glob.glob(os.path.join(RUNS_DIR, "*.json")):
+        d = _json(f, {})
+        if str(d.get("channel")) == str(channel) and d.get("pid") and _alive(d.get("pid")):
+            return True
+    return False
+
+
+def resume_session(entry):
+    """Drop into an interactive `claude --resume` for this channel's session, in
+    the right server's config dir/cwd. Returns when the operator exits claude."""
+    ch, sid = entry["channel"], entry["sid"]
+    cname, gid = channel_info(ch)
+    if not gid:
+        print(f"\n⚠️  couldn't resolve a server for #{cname}."); time.sleep(2); return
+    if _channel_busy(ch):
+        print(f"\n⚠️  #{cname} is busy (an agent is running) — try again when idle."); time.sleep(2); return
+    sd = os.path.join(SERVERS_DIR, gid)
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=os.path.join(sd, ".claude"),
+               MOCHI_CURRENT_GUILD=gid, MOCHI_SERVER_DIR=sd, TMPDIR=os.path.join(sd, "tmp"))
+    cmd = [CLAUDE_BIN, "--resume", sid]
+    if CLAUDE_MODEL:
+        cmd += ["--model", CLAUDE_MODEL]
+    print(f"\n── resuming #{cname} · {guild_name(gid)} — exit claude (/exit or Ctrl-D) to return ──\n", flush=True)
+    try:
+        subprocess.run(cmd, cwd=sd, env=env)
+    except Exception as exc:
+        print(f"resume failed: {exc}"); time.sleep(2)
+
+
+def dashboard(sess=None):
     runs = _runs()
     if runs:
         mid = Columns([agent_panel(d) for d in runs], expand=True)
     else:
         mid = Panel(Text("idle — no agents running right now", style="dim italic"),
                     border_style="dim", padding=(0, 1))
-    return Group(overview(runs), mid, recent())
+    parts = [overview(runs), mid]
+    if sess is not None:
+        parts.append(sessions_panel(sess))
+    parts.append(recent())
+    return Group(*parts)
+
+
+def _poll_key(timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if select.select([sys.stdin], [], [], 0.05)[0]:
+            try:
+                return sys.stdin.read(1)
+            except Exception:
+                return None
+    return None
 
 
 def main():
-    with Live(console=Console(), screen=True, refresh_per_second=4) as live:
+    istty = sys.stdin.isatty()
+    old = None
+    if istty:
         try:
+            old = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        except Exception:
+            old = None
+    try:
+        with Live(console=Console(), screen=True, refresh_per_second=4) as live:
             while True:
-                live.update(dashboard())
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            pass
+                sess = resumable()
+                live.update(dashboard(sess))
+                if istty:
+                    key = _poll_key(0.5)
+                else:
+                    time.sleep(0.5)
+                    key = None
+                if key in ("q", "Q", "\x03"):
+                    break
+                if key and key.isdigit() and key != "0":
+                    idx = int(key) - 1
+                    if idx < len(sess):
+                        live.stop()
+                        if old:
+                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+                        resume_session(sess[idx])
+                        if old:
+                            tty.setcbreak(sys.stdin.fileno())
+                        live.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if old:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
 
 
 if __name__ == "__main__":
