@@ -25,6 +25,9 @@ load_dotenv(os.path.join(WORKSPACE, "secrets.env"), override=True)
 
 SWEEP_CURSORS = os.path.join(WORKSPACE, ".sweep_cursors.json")
 MAX_PER_CHANNEL = int(os.environ.get("SWEEP_MAX_PER_CHANNEL", "40"))
+# Two-stage sweep: a cheap model first decides whether anything needs a reply;
+# only then do we spend the full (opus) review. Most sweeps end at triage.
+SWEEP_TRIAGE_MODEL = os.environ.get("SWEEP_TRIAGE_MODEL", "haiku").strip()
 
 
 def _load():
@@ -135,6 +138,42 @@ def run_sweep(activity, guild_id):
         print(f"[sweep] {guild_id} done (unparsed output)", flush=True)
 
 
+def triage(activity, guild_id):
+    """Cheap first pass (small model, no tools): does anything here actually need
+    Mochi to reply/act? Returns True only if so. On any error, escalate (return
+    True) so we never silently skip something."""
+    instruction = (
+        "You are a cheap FIRST-PASS filter deciding whether to wake the full "
+        "reviewer for Mochi_Bot. Below is a server's recent activity.\n"
+        "Answer NO only when it's clearly just people talking among themselves / "
+        "coordinating with each other and there's plainly nothing for Mochi to do. "
+        "Answer YES if anything might need Mochi to reply or act — an open "
+        "question or request Mochi could help with, a task, a problem — OR if "
+        "you're at all unsure. (Direct @-mentions of Mochi are handled elsewhere; "
+        "don't count those, but err toward YES on anything borderline — the full "
+        "reviewer makes the final call and will stay silent if not needed.)\n"
+        "Answer on the FIRST line with exactly YES or NO, then a short reason.\n\n"
+        f"NEW ACTIVITY:\n{activity}"
+    )
+    server_dir = b.ensure_server_dir(guild_id)
+    env = dict(os.environ, MOCHI_CURRENT_GUILD=str(guild_id),
+               CLAUDE_CONFIG_DIR=os.path.join(server_dir, ".claude"),
+               TMPDIR=os.path.join(server_dir, "tmp"))
+    cmd = [b.CLAUDE_BIN, "-p", "--permission-mode", "dontAsk",
+           "--output-format", "json", "--model", SWEEP_TRIAGE_MODEL, instruction]
+    try:
+        r = subprocess.run(cmd, cwd=server_dir, text=True, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        out = (json.loads(r.stdout or "{}").get("result") or "") if r.returncode == 0 else ""
+    except Exception as exc:
+        print(f"[sweep] {guild_id} triage error: {exc} — escalating", flush=True)
+        return True
+    decision = out.strip().upper().startswith("YES")
+    print(f"[sweep] {guild_id} triage({SWEEP_TRIAGE_MODEL}): "
+          f"{'ACT' if decision else 'skip'} — {out.strip()[:120]}", flush=True)
+    return decision
+
+
 def main():
     if b.is_limited():
         print("[sweep] skipped — rate-limited", flush=True)
@@ -150,9 +189,13 @@ def main():
             break
         blocks = [f"== channel {ch} ({len(lines)} new) ==\n" + "\n".join(lines) for ch, lines in chans]
         n = sum(len(lines) for _, lines in chans)
-        print(f"[sweep] server {guild_id}: {n} new msg(s) across {len(chans)} channel(s) — reviewing", flush=True)
+        activity = "\n\n".join(blocks)
+        print(f"[sweep] server {guild_id}: {n} new msg(s) across {len(chans)} channel(s) — triaging", flush=True)
         try:
-            run_sweep("\n\n".join(blocks), guild_id)
+            if not triage(activity, guild_id):
+                continue  # cheap pass says nothing needs us — skip the full review
+            print(f"[sweep] {guild_id}: escalating to full review", flush=True)
+            run_sweep(activity, guild_id)
         except subprocess.TimeoutExpired:
             print(f"[sweep] {guild_id} review timed out", flush=True)
 
