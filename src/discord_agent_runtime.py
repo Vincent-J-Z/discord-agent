@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -16,6 +16,27 @@ WORKSPACE = os.environ.get(
 )
 load_dotenv(os.path.join(ROOT, ".env"))
 load_dotenv(os.path.join(WORKSPACE, ".env"), override=True)
+
+
+def _check_env_token():
+    """Guardrail against editing the wrong .env. The operative file is
+    WORKSPACE/.env; the repo-root .env (one level above this file) is NOT loaded.
+    Log which token is actually live, and warn loudly if a stray repo-root .env
+    carries a different token so a mistaken edit can't silently keep the old one."""
+    tail = lambda t: ("…" + t[-6:]) if t else "(none)"
+    live = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    print(f"[env] CLAUDE_CODE_OAUTH_TOKEN live: {tail(live)} "
+          f"(operative: {os.path.join(WORKSPACE, '.env')})", flush=True)
+    stray = os.path.join(os.path.dirname(ROOT), ".env")  # repo-root /app/.env — unused
+    if os.path.exists(stray):
+        sv = dotenv_values(stray).get("CLAUDE_CODE_OAUTH_TOKEN")
+        if sv and sv != live:
+            print(f"[env] WARNING: {stray} has a DIFFERENT token {tail(sv)} but is NOT "
+                  f"loaded — edit {os.path.join(WORKSPACE, '.env')} instead; this file is "
+                  f"ignored.", flush=True)
+
+
+_check_env_token()
 
 TICK_SECONDS = int(os.environ.get("TICK_SECONDS", "60"))
 # Proactive review cadence. Activity-driven with timed fallback (0 disables):
