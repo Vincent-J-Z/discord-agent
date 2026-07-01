@@ -155,6 +155,14 @@ def _short(s, n):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _human(n):
+    n = float(n or 0)
+    for unit, div in (("M", 1e6), ("k", 1e3)):
+        if n >= div:
+            return f"{n / div:.1f}{unit}"
+    return str(int(n))
+
+
 def overview(runs):
     now = time.time()
     busy = len(runs)
@@ -350,12 +358,18 @@ def _area_chart(series, ch):
     return rows, mx
 
 
-def heartbeat(runs, cw=64, ch=5, span=900, win=75):
+def heartbeat(runs, cw=None, ch=5, span=900, win=75):
     """Bottom-of-dashboard REAL-TIME CURVE: rolling token-throughput rate
     (tokens/min) over the last `span` seconds, drawn as a FILLED area chart that
     scrolls with time. Each run is spread across a `win`-second triangular window
     so the fill is smooth and continuous, not a spike. Legacy rows without token
-    counts fall back to cost so the chart keeps moving during the transition."""
+    counts fall back to cost so the chart keeps moving during the transition.
+    `cw` auto-sizes to ~half the terminal so it sits 50/50 beside recent runs."""
+    if cw is None:                                   # fit half the terminal width
+        try:
+            cw = max(20, Console().width // 2 - 12)
+        except Exception:
+            cw = 34
     rows = _usage()
     now = time.time()
     step = span / cw
@@ -398,9 +412,8 @@ def heartbeat(runs, cw=64, ch=5, span=900, win=75):
     axis.add_row(f"[dim]{'-' + str(int(span / 60)) + 'm':>10}[/]",
                  "[bold red]♥ live[/]" if live else "[dim]♡ idle[/]",
                  "[dim]now[/]")
-    unit = "tok/min" if have_tok else "≈tok/min(cost)"
-    sub = (f"now ~{int(now_rate):,} {unit} · peak {int(mx):,} · "
-           f"last {int(span / 60)}m {int(tot_tok):,} tok · ${tot_cost:.2f}")
+    pre = "" if have_tok else "≈"          # peak is already the Y-axis top label
+    sub = f"{pre}~{_human(now_rate)}/min · Σ{_human(tot_tok)} · ${tot_cost:.2f}"
     return Panel(Group(body, axis), title="💓 token usage (live)",
                  subtitle=sub, border_style="red", padding=(0, 1))
 
@@ -418,8 +431,7 @@ def dashboard(sess=None):
         parts.append(subagents_panel(subs))
     if sess is not None:
         parts.append(sessions_panel(sess))
-    parts.append(recent())
-    parts.append(heartbeat(runs))
+    parts.append(Columns([recent(), heartbeat(runs)], expand=True, equal=True))
     return Group(*parts)
 
 
