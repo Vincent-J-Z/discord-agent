@@ -216,11 +216,14 @@ def recent(rows=7):
     t.add_column("cost", justify="right")
     t.add_column("turns", justify="right")
     t.add_column("dur", justify="right")
-    for r in list(reversed(u))[:rows]:
+    data = list(reversed(u))[:rows]
+    for r in data:
         cname, gid = channel_info(r.get("channel"))
         loc = f"{_short(guild_name(gid), 12)}/#{_short(cname, 16)}"
         t.add_row(loc, f"${(r.get('cost_usd') or 0):.4f}",
                   str(r.get("turns") or "?"), f"{(r.get('duration_ms') or 0) // 1000}s")
+    for _ in range(rows - len(data)):           # pad to a fixed height so the
+        t.add_row("", "", "", "")               # bottom edge lines up with the chart
     return Panel(t, title="recent runs", border_style=BOTTOM_BORDER, padding=(0, 1))
 
 
@@ -362,7 +365,7 @@ def _area_chart(series, ch):
     return rows, mx
 
 
-def heartbeat(runs, cw=None, ch=7, span=900, win=75):
+def heartbeat(runs, cw=None, ch=10, span=900, win=75):
     """Bottom-of-dashboard REAL-TIME CURVE: rolling token-throughput rate
     (tokens/min) over the last `span` seconds, drawn as a FILLED area chart that
     scrolls with time. Each run is spread across a `win`-second triangular window
