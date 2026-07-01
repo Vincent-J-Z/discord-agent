@@ -322,55 +322,83 @@ def resume_session(entry):
         print(f"resume failed: {exc}"); time.sleep(2)
 
 
-def heartbeat(runs, nb=60, span=1800):
-    """Bottom-of-dashboard heartbeat: token throughput over the last `span`
-    seconds in `nb` buckets, drawn as a colored sparkline (like an ECG trace).
-    Uses in+out tokens; legacy rows without token counts fall back to cost so
-    the trace still shows something during the transition."""
+def _braille_chart(series, cw, ch):
+    """Render a value series as a multi-row braille line chart (2×4 dots/char).
+    Returns (lines, max): `lines` is `ch` strings of `cw` chars each, a smooth
+    connected curve. Consecutive samples are joined vertically so it reads as a
+    continuous line rather than dots."""
+    npts, px_h = 2 * cw, 4 * ch
+    mx = max(series) or 1.0
+    DOT = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))  # DOT[dx][dy]
+    grid = [[0] * cw for _ in range(ch)]
+    prev = None
+    for x in range(min(npts, len(series))):
+        h = int(max(0.0, min(1.0, series[x] / mx)) * (px_h - 1))
+        y = px_h - 1 - h                                   # pixel row from top
+        cx, dx = divmod(x, 2)
+        span = [y] if prev is None else range(min(prev, y), max(prev, y) + 1)
+        for yy in span:
+            cy, dy = divmod(yy, 4)
+            if 0 <= cy < ch:
+                grid[cy][cx] |= DOT[dx][dy]
+        prev = y
+    return ["".join(chr(0x2800 + c) for c in row) for row in grid], mx
+
+
+def heartbeat(runs, cw=56, ch=5, span=900, win=60):
+    """Bottom-of-dashboard REAL-TIME CURVE: rolling token-throughput rate
+    (tokens/min) over the last `span` seconds, as a braille line chart that
+    scrolls with time. Each run spreads its tokens across a `win`-second window
+    so the curve is smooth/continuous, not a spike. Legacy rows without token
+    counts fall back to cost so the line keeps moving during the transition."""
     rows = _usage()
     now = time.time()
-    width = span / nb
-    buckets = [0.0] * nb
+    npts = 2 * cw
+    step = span / npts
+    series = [0.0] * npts
     tot_tok = tot_cost = 0.0
     have_tok = False
     for r in rows:
-        age = now - (r.get("ts") or 0)
-        if not (0 <= age < span):
+        ts = r.get("ts") or 0
+        if ts < now - span - win or ts > now + 1:
             continue
         tok = (r.get("in_tokens") or 0) + (r.get("out_tokens") or 0)
-        cost = r.get("cost_usd") or 0
-        tot_tok += tok
-        tot_cost += cost
+        cost = r.get("cost_usd") or 0.0
         have_tok = have_tok or tok > 0
-        idx = min(max(nb - 1 - int(age // width), 0), nb - 1)
-        buckets[idx] += tok if tok else cost * 5000  # cost→pseudo-tokens for legacy
-    peak = max(buckets) or 1.0
-    spark = Text()
-    for v in buckets:
-        if v <= 0:
-            spark.append("·", style="grey37")
-            continue
-        lvl = min(7, round(v / peak * 7))
-        col = "green" if lvl <= 2 else "yellow" if lvl <= 5 else "red"
-        spark.append(SPARK[lvl], style=f"bold {col}")
-    # A live pulse: agents burning tokens right now (telemetry, pre-logging).
+        if now - ts < span:
+            tot_tok += tok
+            tot_cost += cost
+        rate = (tok if tok else cost * 5000) / (win / 60.0)   # tokens/min at the peak
+        half = win / 2.0
+        lo = int((ts - half - (now - span)) / step)
+        hi = int((ts + half - (now - span)) / step)
+        for j in range(max(0, lo), min(npts, hi + 1)):
+            jc = (now - span) + (j + 0.5) * step              # this sample's timestamp
+            w = 1.0 - abs(jc - ts) / half                     # triangular window → smooth hump
+            if w > 0:
+                series[j] += rate * w
+    lines, mx = _braille_chart(series, cw, ch)
+    rowcols = ["red", "red", "yellow", "green", "green"]
+    ylab = [f"{int(mx):>6,}", "", f"{int(mx / 2):>6,}", "", f"{0:>6}"]
+    body = Text()
+    for i, ln in enumerate(lines):
+        body.append(f"{ylab[i] if i < len(ylab) else '':>6} ", style="dim")
+        body.append(ln + ("\n" if i < len(lines) - 1 else ""),
+                    style=rowcols[i] if i < len(rowcols) else "green")
     live = len(runs)
-    spark.append("  ")
-    spark.append(f"♥ {live} live" if live else "♡ idle",
-                 style="bold red" if live else "dim")
-    nrecent = max(1, int(300 / width))            # last ~5 min of buckets
-    rate = sum(buckets[-nrecent:]) / 5            # per-minute over last 5 min
-    peak_min = peak * (60 / width)                # bucket peak → per-minute
-    unit = "tok" if have_tok else "≈tok(cost)"
+    now_rate = series[-1] if series else 0
     axis = Table.grid(expand=True)
     axis.add_column(justify="left")
+    axis.add_column(justify="center")
     axis.add_column(justify="right")
-    axis.add_row(f"[dim]-{int(span/60)}m[/]", "[dim]now[/]")
-    sub = (f"{int(tot_tok):,} {unit} · ${tot_cost:.2f} · peak {int(peak_min):,}/min · "
-           f"now ~{int(rate):,}/min")
-    return Panel(Group(spark, axis),
-                 title="💓 token heartbeat", subtitle=sub,
-                 border_style="red", padding=(0, 1))
+    axis.add_row(f"[dim]{'-' + str(int(span / 60)) + 'm':>10}[/]",
+                 "[bold red]♥ live[/]" if live else "[dim]♡ idle[/]",
+                 "[dim]now[/]")
+    unit = "tok/min" if have_tok else "≈tok/min(cost)"
+    sub = (f"now ~{int(now_rate):,} {unit} · peak {int(mx):,} · "
+           f"last {int(span / 60)}m {int(tot_tok):,} tok · ${tot_cost:.2f}")
+    return Panel(Group(body, axis), title="💓 token usage (live)",
+                 subtitle=sub, border_style="red", padding=(0, 1))
 
 
 def dashboard(sess=None):
