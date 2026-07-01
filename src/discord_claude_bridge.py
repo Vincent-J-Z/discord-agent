@@ -44,6 +44,7 @@ GUILD_IDS = [g.strip() for g in os.environ.get("DISCORD_GUILD_ID", "").split(","
 BOT_ID = os.environ["DISCORD_BOT_ID"]
 ROLE_ID = os.environ.get("DISCORD_ROLE_ID", "").strip()
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+AGENT_NAME = os.environ.get("AGENT_NAME", "Claude Agent")
 CLAUDE_CWD = os.environ.get("CLAUDE_CWD", ROOT)
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 # Reasoning effort: low | medium | high | xhigh | max. Higher = more thinking
@@ -145,9 +146,9 @@ LIMITED_FILE = os.path.join(WORKSPACE, ".limited_until")
 DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred")
 LIMIT_DEFAULT_COOLDOWN = int(os.environ.get("LIMIT_DEFAULT_COOLDOWN", "3600"))
 HELP_TEXT = (
-    "**Mochi_Bot** — @ 我即可。我能:\n"
+    f"**{AGENT_NAME}** — @ 我即可。我能:\n"
     "• 读/写本服务器任意频道和 forum thread\n"
-    "• 跑命令、读改自己的代码(热重载)、`ssh fin-agent`、查 DB/pipeline\n"
+    "• 跑命令、读改自己的代码(热重载)、用工具箱做事\n"
     "• 看你贴的图片/文件(截图报错也行)\n"
     "• 每个频道是一段持续会话(记得上下文);长任务会分阶段汇报\n"
     "• 每小时静默巡检,有需要才出声\n"
@@ -802,7 +803,7 @@ def post(channel_id, content, mention_user_id=None):
     # the text (any <@id> / <@!id> the model wrote), plus the reply target. We
     # don't use {"parse": ["users"]} blanket because that would also let stray
     # ids in quoted/example text ping people; whitelisting only ids we see in
-    # our own content keeps it deliberate while still letting Mochi @ others.
+    # our own content keeps it deliberate while still letting the agent @ others.
     ids = set(re.findall(r"<@!?(\d+)>", content))
     if mention_user_id:
         ids.add(str(mention_user_id))
@@ -1229,7 +1230,7 @@ def drain_deferred():
         except Exception as exc:
             reply = f"Bridge error: {exc}"
         # Don't @ a bot author on resume either (avoid re-triggering the loop); the
-        # reply itself can mention a specific bot if Mochi decides it's needed.
+        # reply itself can mention a specific bot if the agent decides it's needed.
         mention = None if latest.get("is_bot") else latest.get("author_id")
         try:
             post_reply(ch, reply, mention_user_id=mention)
@@ -1253,13 +1254,17 @@ def ensure_server_dir(guild_id):
     base = os.path.join(SERVERS_DIR, name)
     for d in (base, os.path.join(base, ".claude"), os.path.join(base, "tmp")):
         os.makedirs(d, exist_ok=True)
-    link = os.path.join(base, "CLAUDE.md")
-    src = os.path.join(os.path.dirname(ROOT), "CLAUDE.md")  # /app/CLAUDE.md
-    try:
-        if not os.path.lexists(link):
-            os.symlink(src, link)
-    except OSError:
-        pass
+    # Symlink the operating context in so claude loads it. CLAUDE.md is the
+    # public/generic context; CLAUDE.local.md (gitignored, optional) holds any
+    # private deployment knowledge and is linked only if present.
+    for fn in ("CLAUDE.md", "CLAUDE.local.md"):
+        src = os.path.join(os.path.dirname(ROOT), fn)  # /app/<fn>
+        link = os.path.join(base, fn)
+        try:
+            if os.path.exists(src) and not os.path.lexists(link):
+                os.symlink(src, link)
+        except OSError:
+            pass
     return base
 
 
@@ -1386,7 +1391,7 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None):
         else ""
     )
     instruction = (
-        "You are Mochi_Bot replying to a Discord message in this server. Your "
+        f"You are {AGENT_NAME} replying to a Discord message in this server. Your "
         "context, capabilities, and the /app/src/discord_api.py toolbox are in "
         "CLAUDE.md (already loaded).\n"
         "Treat this as the ONLY Discord server you serve. Stay within this "
@@ -1425,8 +1430,8 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None):
     server_dir = ensure_server_dir(guild_id)
     sub_env = dict(
         os.environ,
-        MOCHI_CURRENT_GUILD=str(guild_id or ""),
-        MOCHI_SERVER_DIR=server_dir,
+        AGENT_CURRENT_GUILD=str(guild_id or ""),
+        AGENT_SERVER_DIR=server_dir,
         CLAUDE_CONFIG_DIR=os.path.join(server_dir, ".claude"),
         TMPDIR=os.path.join(server_dir, "tmp"),
     )

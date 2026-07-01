@@ -2,7 +2,7 @@
 
 Gathers new activity since the last sweep and reviews EACH server separately:
 its own Claude session (`__sweep__<guild_id>`), its own toolbox scope
-(MOCHI_CURRENT_GUILD), and it only ever acts within that server. No server's
+(AGENT_CURRENT_GUILD), and it only ever acts within that server. No server's
 activity is ever mixed with, or surfaced in, another. Triggered by
 discord_agent_runtime on a timer.
 
@@ -88,7 +88,7 @@ def run_sweep(activity, guild_id):
     session_key = f"__sweep__{guild_id}"
     session_id = b.get_session(session_key)
     instruction = (
-        "You are Mochi_Bot doing your scheduled hourly review of this Discord "
+        f"You are {b.AGENT_NAME} doing your scheduled hourly review of this Discord "
         "server. Below is the NEW activity in it since your last review.\n"
         "Stay within this server and your working directory; the toolbox is "
         "scoped to this server. Never reference, reveal, or act on anything "
@@ -104,8 +104,8 @@ def run_sweep(activity, guild_id):
     server_dir = b.ensure_server_dir(guild_id)
     sub_env = dict(
         os.environ,
-        MOCHI_CURRENT_GUILD=str(guild_id),
-        MOCHI_SERVER_DIR=server_dir,
+        AGENT_CURRENT_GUILD=str(guild_id),
+        AGENT_SERVER_DIR=server_dir,
         CLAUDE_CONFIG_DIR=os.path.join(server_dir, ".claude"),
         TMPDIR=os.path.join(server_dir, "tmp"),
     )
@@ -140,23 +140,23 @@ def run_sweep(activity, guild_id):
 
 def triage(activity, guild_id):
     """Cheap first pass (small model, no tools): does anything here actually need
-    Mochi to reply/act? Returns True only if so. On any error, escalate (return
-    True) so we never silently skip something."""
+    the agent to reply/act? Returns True only if so. On any error, escalate
+    (return True) so we never silently skip something."""
     instruction = (
         "You are a cheap FIRST-PASS filter deciding whether to wake the full "
-        "reviewer for Mochi_Bot. Below is a server's recent activity.\n"
+        f"reviewer for {b.AGENT_NAME}. Below is a server's recent activity.\n"
         "Answer NO only when it's clearly just people talking among themselves / "
-        "coordinating with each other and there's plainly nothing for Mochi to do. "
-        "Answer YES if anything might need Mochi to reply or act — an open "
-        "question or request Mochi could help with, a task, a problem — OR if "
-        "you're at all unsure. (Direct @-mentions of Mochi are handled elsewhere; "
+        f"coordinating with each other and there's plainly nothing for {b.AGENT_NAME} to do. "
+        f"Answer YES if anything might need {b.AGENT_NAME} to reply or act — an open "
+        f"question or request {b.AGENT_NAME} could help with, a task, a problem — OR if "
+        f"you're at all unsure. (Direct @-mentions of {b.AGENT_NAME} are handled elsewhere; "
         "don't count those, but err toward YES on anything borderline — the full "
         "reviewer makes the final call and will stay silent if not needed.)\n"
         "Answer on the FIRST line with exactly YES or NO, then a short reason.\n\n"
         f"NEW ACTIVITY:\n{activity}"
     )
     server_dir = b.ensure_server_dir(guild_id)
-    env = dict(os.environ, MOCHI_CURRENT_GUILD=str(guild_id),
+    env = dict(os.environ, AGENT_CURRENT_GUILD=str(guild_id),
                CLAUDE_CONFIG_DIR=os.path.join(server_dir, ".claude"),
                TMPDIR=os.path.join(server_dir, "tmp"))
     cmd = [b.CLAUDE_BIN, "-p", "--permission-mode", "dontAsk",

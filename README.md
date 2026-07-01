@@ -1,4 +1,4 @@
-# discord-agent (Mochi_Bot)
+# discord-agent
 
 A self-hosted Discord agent that bridges Discord mentions to the Claude Code CLI.
 Mention the bot in any channel or forum thread and it answers — with real shell,
@@ -16,10 +16,11 @@ network, and tool access — running headless inside a hardened container.
 
 ## Layout
 ```
-src/        Python runtime (bridge, gateway, sweep, toolbox, …)
-docs/       DEPLOY.md (full deploy guide), FEATURE-REPORT.md (roadmap)
-examples/   .env / secrets / compose templates
-CLAUDE.md   the bot's operating context (loaded by claude each run, cwd=/app)
+src/          Python runtime (bridge, gateway, sweep, toolbox, …)
+docs/         DEPLOY.md (full deploy guide)
+examples/     .env / secrets / compose templates
+CLAUDE.md     the agent's generic operating context (loaded by claude each run)
+CLAUDE.local.md   optional, gitignored — your private deployment context
 Containerfile · compose.yaml · run-container.sh · autostart.sh   build/run/boot
 ```
 
@@ -45,8 +46,12 @@ container build -t discord-agent:local -f Containerfile .
 
 ## Configuration
 Runtime config lives in the workspace `.env` (never committed). Key knobs:
-`DISCORD_GUILD_ID` (watch the whole guild), `CLAUDE_MODEL`, `CLAUDE_PERMISSION_MODE`,
+`AGENT_NAME` (what the bot calls itself, default `Claude Agent`), `DISCORD_GUILD_ID`
+(watch the whole guild), `CLAUDE_MODEL`, `CLAUDE_PERMISSION_MODE`,
 `CLAUDE_TIMEOUT_SECONDS`, `HISTORY_LIMIT`, `GATEWAY_WORKERS`, `BOT_ACTIVITY`.
+
+To give the agent its own name and private deployment knowledge, set `AGENT_NAME`
+in the workspace `.env` and drop a gitignored `CLAUDE.local.md` next to `CLAUDE.md`.
 
 > **Security:** the bot runs with `bypassPermissions` inside the container, so
 > anyone who can mention it can make it run commands there. Restrict with

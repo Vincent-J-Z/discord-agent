@@ -1,11 +1,11 @@
 ---
 name: discord
-description: Read from and act on any Discord channel or thread in Mochi_Bot's guild — read messages, post/reply, react, edit, pin, list channels/threads, and create forum posts. Use whenever a request involves looking at or sending to Discord, especially another channel/thread (e.g. "reply to the @ in omega"), forums, reactions, or pins.
+description: Read from and act on any Discord channel or thread in the bot's guild — read messages, post/reply, react, edit, pin, list channels/threads, and create forum posts. Use whenever a request involves looking at or sending to Discord, especially another channel/thread (e.g. "reply to the @ in a forum"), forums, reactions, or pins.
 ---
 
 # Discord operations
 
-Mochi_Bot acts over the Discord REST API with its bot token (`$DISCORD_BOT_TOKEN`).
+The bot acts over the Discord REST API with its bot token (`$DISCORD_BOT_TOKEN`).
 All operations go through one CLI: **`/app/src/discord_api.py`**. Channel ids and
 thread ids are interchangeable (a thread is just a channel).
 
@@ -29,14 +29,14 @@ python /app/src/discord_api.py edit  <channel_id> <msg_id> "updated text"  # edi
 python /app/src/discord_api.py pin   <channel_id> <msg_id>
 ```
 
-Forums (e.g. `omega`) — a "new post" is a new thread:
+Forums — a "new post" is a new thread:
 
 ```bash
 python /app/src/discord_api.py forum-post <forum_id> "Post title" "first message body"
 ```
 
 ## Notes
-- To reply inside an omega thread: `threads` to get the thread id, `read` it for
+- To reply inside a forum thread: `threads` to get the thread id, `read` it for
   context, then `reply`/`post` to that thread id.
 - Never echo the token into a Discord message.
 - Moderation, slash commands, and voice are NOT available via this toolbox —

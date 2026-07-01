@@ -13,7 +13,7 @@ ARG CLAUDE_CODE_VERSION=latest
 
 # System tooling the agent actually needs to do dev/pipeline work:
 #   ffmpeg            — remux/transcode (the video-capture fix needs this)
-#   postgresql-client — psql against SUPABASE_DB_URL
+#   postgresql-client — psql against a Postgres DSN
 #   libpq-dev + build-essential — so `pip install psycopg2` etc. work in a venv
 #   gh                — open/merge PRs
 #   curl, jq, unzip   — general scripting
@@ -49,8 +49,8 @@ RUN echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent \
 
 # Default git identity (for commits/PRs) and trust the bind-mounted /app even
 # though its files are owned by the host uid.
-RUN git config --system user.name "Mochi_Bot" \
-    && git config --system user.email "mochi-bot@users.noreply.github.com" \
+RUN git config --system user.name "discord-agent" \
+    && git config --system user.email "discord-agent@users.noreply.github.com" \
     && git config --system safe.directory '*'
 
 # Python runtime lives in src/; CLAUDE.md stays at the repo root (claude's cwd).
