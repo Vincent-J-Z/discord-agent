@@ -322,40 +322,44 @@ def resume_session(entry):
         print(f"resume failed: {exc}"); time.sleep(2)
 
 
-def _braille_chart(series, cw, ch):
-    """Render a value series as a multi-row braille line chart (2×4 dots/char).
-    Returns (lines, max): `lines` is `ch` strings of `cw` chars each, a smooth
-    connected curve. Consecutive samples are joined vertically so it reads as a
-    continuous line rather than dots."""
-    npts, px_h = 2 * cw, 4 * ch
+BLOCKS = " ▁▂▃▄▅▆▇█"                                  # 0..8 eighths of a row
+ROWCOLS = ("red", "red", "yellow", "green", "green")   # top → bottom color bands
+
+
+def _area_chart(series, ch):
+    """Filled area chart: each column is filled solid from the baseline up to its
+    value (block chars, 1/8-row sub-precision at the tip), colored in horizontal
+    bands so the fill gradients green→yellow→red with height. Returns
+    (list-of-Text-rows, max)."""
     mx = max(series) or 1.0
-    DOT = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))  # DOT[dx][dy]
-    grid = [[0] * cw for _ in range(ch)]
-    prev = None
-    for x in range(min(npts, len(series))):
-        h = int(max(0.0, min(1.0, series[x] / mx)) * (px_h - 1))
-        y = px_h - 1 - h                                   # pixel row from top
-        cx, dx = divmod(x, 2)
-        span = [y] if prev is None else range(min(prev, y), max(prev, y) + 1)
-        for yy in span:
-            cy, dy = divmod(yy, 4)
-            if 0 <= cy < ch:
-                grid[cy][cx] |= DOT[dx][dy]
-        prev = y
-    return ["".join(chr(0x2800 + c) for c in row) for row in grid], mx
+    rows = []
+    for r in range(ch):                                 # r = 0 at the top
+        lvl = ch - 1 - r                                # this row's height from bottom
+        col = ROWCOLS[r] if r < len(ROWCOLS) else "green"
+        line = Text()
+        for v in series:
+            filled = min(1.0, v / mx) * ch              # column height, in rows
+            full = int(filled)
+            if lvl < full:
+                line.append(BLOCKS[8], style=col)       # fully filled
+            elif lvl == full:
+                line.append(BLOCKS[int((filled - full) * 8)], style=col)  # partial tip
+            else:
+                line.append(" ")
+        rows.append(line)
+    return rows, mx
 
 
-def heartbeat(runs, cw=56, ch=5, span=900, win=60):
+def heartbeat(runs, cw=64, ch=5, span=900, win=75):
     """Bottom-of-dashboard REAL-TIME CURVE: rolling token-throughput rate
-    (tokens/min) over the last `span` seconds, as a braille line chart that
-    scrolls with time. Each run spreads its tokens across a `win`-second window
-    so the curve is smooth/continuous, not a spike. Legacy rows without token
-    counts fall back to cost so the line keeps moving during the transition."""
+    (tokens/min) over the last `span` seconds, drawn as a FILLED area chart that
+    scrolls with time. Each run is spread across a `win`-second triangular window
+    so the fill is smooth and continuous, not a spike. Legacy rows without token
+    counts fall back to cost so the chart keeps moving during the transition."""
     rows = _usage()
     now = time.time()
-    npts = 2 * cw
-    step = span / npts
-    series = [0.0] * npts
+    step = span / cw
+    series = [0.0] * cw
     tot_tok = tot_cost = 0.0
     have_tok = False
     for r in rows:
@@ -372,19 +376,19 @@ def heartbeat(runs, cw=56, ch=5, span=900, win=60):
         half = win / 2.0
         lo = int((ts - half - (now - span)) / step)
         hi = int((ts + half - (now - span)) / step)
-        for j in range(max(0, lo), min(npts, hi + 1)):
-            jc = (now - span) + (j + 0.5) * step              # this sample's timestamp
+        for j in range(max(0, lo), min(cw, hi + 1)):
+            jc = (now - span) + (j + 0.5) * step              # this column's timestamp
             w = 1.0 - abs(jc - ts) / half                     # triangular window → smooth hump
             if w > 0:
                 series[j] += rate * w
-    lines, mx = _braille_chart(series, cw, ch)
-    rowcols = ["red", "red", "yellow", "green", "green"]
+    chart, mx = _area_chart(series, ch)
     ylab = [f"{int(mx):>6,}", "", f"{int(mx / 2):>6,}", "", f"{0:>6}"]
     body = Text()
-    for i, ln in enumerate(lines):
+    for i, ln in enumerate(chart):
         body.append(f"{ylab[i] if i < len(ylab) else '':>6} ", style="dim")
-        body.append(ln + ("\n" if i < len(lines) - 1 else ""),
-                    style=rowcols[i] if i < len(rowcols) else "green")
+        body.append_text(ln)
+        if i < len(chart) - 1:
+            body.append("\n")
     live = len(runs)
     now_rate = series[-1] if series else 0
     axis = Table.grid(expand=True)
