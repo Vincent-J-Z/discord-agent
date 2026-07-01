@@ -1049,6 +1049,7 @@ def post_reply(channel_id, content, mention_user_id=None):
 
 def log_usage(channel_id, author, data):
     try:
+        u = data.get("usage") or {}
         rec = {
             "ts": round(time.time()),
             "channel": str(channel_id),
@@ -1056,6 +1057,10 @@ def log_usage(channel_id, author, data):
             "cost_usd": data.get("total_cost_usd"),
             "turns": data.get("num_turns"),
             "duration_ms": data.get("duration_ms"),
+            "in_tokens": u.get("input_tokens") or 0,
+            "out_tokens": u.get("output_tokens") or 0,
+            "cache_tokens": (u.get("cache_read_input_tokens") or 0)
+            + (u.get("cache_creation_input_tokens") or 0),
         }
         with open(USAGE_FILE, "a") as f:
             f.write(json.dumps(rec) + "\n")

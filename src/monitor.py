@@ -41,6 +41,7 @@ SUBAGENTS_DIR = os.path.join(WORKSPACE, "subagents")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 PHASE_STYLE = {"💭 thinking": "yellow", "✍️ replying": "green", "done": "dim", "starting": "cyan"}
+SPARK = "▁▂▃▄▅▆▇█"
 
 # Resolve guild/channel ids → human names via the bot token, cached to disk so we
 # don't hit the API on every refresh (names rarely change).
@@ -321,6 +322,57 @@ def resume_session(entry):
         print(f"resume failed: {exc}"); time.sleep(2)
 
 
+def heartbeat(runs, nb=60, span=1800):
+    """Bottom-of-dashboard heartbeat: token throughput over the last `span`
+    seconds in `nb` buckets, drawn as a colored sparkline (like an ECG trace).
+    Uses in+out tokens; legacy rows without token counts fall back to cost so
+    the trace still shows something during the transition."""
+    rows = _usage()
+    now = time.time()
+    width = span / nb
+    buckets = [0.0] * nb
+    tot_tok = tot_cost = 0.0
+    have_tok = False
+    for r in rows:
+        age = now - (r.get("ts") or 0)
+        if not (0 <= age < span):
+            continue
+        tok = (r.get("in_tokens") or 0) + (r.get("out_tokens") or 0)
+        cost = r.get("cost_usd") or 0
+        tot_tok += tok
+        tot_cost += cost
+        have_tok = have_tok or tok > 0
+        idx = min(max(nb - 1 - int(age // width), 0), nb - 1)
+        buckets[idx] += tok if tok else cost * 5000  # cost→pseudo-tokens for legacy
+    peak = max(buckets) or 1.0
+    spark = Text()
+    for v in buckets:
+        if v <= 0:
+            spark.append("·", style="grey37")
+            continue
+        lvl = min(7, round(v / peak * 7))
+        col = "green" if lvl <= 2 else "yellow" if lvl <= 5 else "red"
+        spark.append(SPARK[lvl], style=f"bold {col}")
+    # A live pulse: agents burning tokens right now (telemetry, pre-logging).
+    live = len(runs)
+    spark.append("  ")
+    spark.append(f"♥ {live} live" if live else "♡ idle",
+                 style="bold red" if live else "dim")
+    nrecent = max(1, int(300 / width))            # last ~5 min of buckets
+    rate = sum(buckets[-nrecent:]) / 5            # per-minute over last 5 min
+    peak_min = peak * (60 / width)                # bucket peak → per-minute
+    unit = "tok" if have_tok else "≈tok(cost)"
+    axis = Table.grid(expand=True)
+    axis.add_column(justify="left")
+    axis.add_column(justify="right")
+    axis.add_row(f"[dim]-{int(span/60)}m[/]", "[dim]now[/]")
+    sub = (f"{int(tot_tok):,} {unit} · ${tot_cost:.2f} · peak {int(peak_min):,}/min · "
+           f"now ~{int(rate):,}/min")
+    return Panel(Group(spark, axis),
+                 title="💓 token heartbeat", subtitle=sub,
+                 border_style="red", padding=(0, 1))
+
+
 def dashboard(sess=None):
     runs = _runs()
     if runs:
@@ -335,6 +387,7 @@ def dashboard(sess=None):
     if sess is not None:
         parts.append(sessions_panel(sess))
     parts.append(recent())
+    parts.append(heartbeat(runs))
     return Group(*parts)
 
 
