@@ -22,12 +22,15 @@ import tty
 
 import httpx
 from dotenv import load_dotenv
+from rich import box
 from rich.columns import Columns
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+BOTTOM_BORDER = "grey42"     # shared soft border for the bottom two panels
 
 WORKSPACE = os.environ.get("DISCORD_AGENT_WORKSPACE", "/workspace")
 RUNS_DIR = os.path.join(WORKSPACE, ".runs")
@@ -205,19 +208,20 @@ def agent_panel(d):
                  title=f"agent {d.get('pid', '?')}", width=56, padding=(0, 1))
 
 
-def recent():
+def recent(rows=7):
     u = _usage()
-    t = Table(title="recent runs", expand=True, border_style="dim", title_style="bold dim")
+    t = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False,
+              border_style="grey30", header_style="bold dim")
     t.add_column("server / channel")
     t.add_column("cost", justify="right")
     t.add_column("turns", justify="right")
     t.add_column("dur", justify="right")
-    for r in list(reversed(u))[:6]:
+    for r in list(reversed(u))[:rows]:
         cname, gid = channel_info(r.get("channel"))
         loc = f"{_short(guild_name(gid), 12)}/#{_short(cname, 16)}"
         t.add_row(loc, f"${(r.get('cost_usd') or 0):.4f}",
                   str(r.get("turns") or "?"), f"{(r.get('duration_ms') or 0) // 1000}s")
-    return t
+    return Panel(t, title="recent runs", border_style=BOTTOM_BORDER, padding=(0, 1))
 
 
 def _tmux_alive(name):
@@ -331,7 +335,6 @@ def resume_session(entry):
 
 
 BLOCKS = " ▁▂▃▄▅▆▇█"                                  # 0..8 eighths of a row
-ROWCOLS = ("red", "red", "yellow", "green", "green")   # top → bottom color bands
 
 
 def _area_chart(series, ch):
@@ -343,7 +346,8 @@ def _area_chart(series, ch):
     rows = []
     for r in range(ch):                                 # r = 0 at the top
         lvl = ch - 1 - r                                # this row's height from bottom
-        col = ROWCOLS[r] if r < len(ROWCOLS) else "green"
+        frac = r / max(1, ch - 1)                       # 0 at top … 1 at bottom
+        col = "red" if frac < 0.28 else "yellow" if frac < 0.55 else "green"
         line = Text()
         for v in series:
             filled = min(1.0, v / mx) * ch              # column height, in rows
@@ -358,7 +362,7 @@ def _area_chart(series, ch):
     return rows, mx
 
 
-def heartbeat(runs, cw=None, ch=5, span=900, win=75):
+def heartbeat(runs, cw=None, ch=7, span=900, win=75):
     """Bottom-of-dashboard REAL-TIME CURVE: rolling token-throughput rate
     (tokens/min) over the last `span` seconds, drawn as a FILLED area chart that
     scrolls with time. Each run is spread across a `win`-second triangular window
@@ -396,10 +400,11 @@ def heartbeat(runs, cw=None, ch=5, span=900, win=75):
             if w > 0:
                 series[j] += rate * w
     chart, mx = _area_chart(series, ch)
-    ylab = [f"{int(mx):>6,}", "", f"{int(mx / 2):>6,}", "", f"{0:>6}"]
+    ylab = [""] * ch
+    ylab[0], ylab[-1], ylab[ch // 2] = f"{int(mx):,}", "0", f"{int(mx / 2):,}"
     body = Text()
     for i, ln in enumerate(chart):
-        body.append(f"{ylab[i] if i < len(ylab) else '':>6} ", style="dim")
+        body.append(f"{ylab[i]:>7} ", style="dim")
         body.append_text(ln)
         if i < len(chart) - 1:
             body.append("\n")
@@ -409,13 +414,13 @@ def heartbeat(runs, cw=None, ch=5, span=900, win=75):
     axis.add_column(justify="left")
     axis.add_column(justify="center")
     axis.add_column(justify="right")
-    axis.add_row(f"[dim]{'-' + str(int(span / 60)) + 'm':>10}[/]",
+    axis.add_row(f"[dim]{' ' * 8}-{int(span / 60)}m[/]",
                  "[bold red]♥ live[/]" if live else "[dim]♡ idle[/]",
                  "[dim]now[/]")
     pre = "" if have_tok else "≈"          # peak is already the Y-axis top label
     sub = f"{pre}~{_human(now_rate)}/min · Σ{_human(tot_tok)} · ${tot_cost:.2f}"
     return Panel(Group(body, axis), title="💓 token usage (live)",
-                 subtitle=sub, border_style="red", padding=(0, 1))
+                 subtitle=sub, border_style=BOTTOM_BORDER, padding=(0, 1))
 
 
 def dashboard(sess=None):
@@ -431,7 +436,11 @@ def dashboard(sess=None):
         parts.append(subagents_panel(subs))
     if sess is not None:
         parts.append(sessions_panel(sess))
-    parts.append(Columns([recent(), heartbeat(runs)], expand=True, equal=True))
+    bottom = Table.grid(expand=True, padding=(0, 1))
+    bottom.add_column(ratio=1)
+    bottom.add_column(ratio=1)
+    bottom.add_row(recent(), heartbeat(runs))
+    parts.append(bottom)
     return Group(*parts)
 
 
