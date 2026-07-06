@@ -137,6 +137,12 @@ def main():
     # Supervised separately and respawned if it dies; its absence must never
     # take the bridge down.
     gateway = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_gateway.py")])
+    # Slack bridge (Socket Mode) — only when both Slack tokens are configured.
+    slack_on = bool(os.environ.get("SLACK_BOT_TOKEN", "").strip()
+                    and os.environ.get("SLACK_APP_TOKEN", "").strip())
+    slack = subprocess.Popen([sys.executable, os.path.join(ROOT, "slack_bridge.py")]) if slack_on else None
+    if slack_on:
+        print("[runtime] slack bridge launched", flush=True)
     if SWEEP_INTERVAL > 0 and _last_sweep() == 0.0:
         _mark_sweep()  # don't sweep the instant we boot; first sweep one interval later
     sweep = None
@@ -146,6 +152,9 @@ def main():
             if gateway.poll() is not None:
                 print("[runtime] gateway exited; respawning", flush=True)
                 gateway = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_gateway.py")])
+            if slack_on and slack.poll() is not None:
+                print("[runtime] slack bridge exited; respawning", flush=True)
+                slack = subprocess.Popen([sys.executable, os.path.join(ROOT, "slack_bridge.py")])
             # Auto-resume: when the rate limit clears, answer the deferred queue.
             if (resume is None or resume.poll() is not None) and _resume_due():
                 print("[runtime] rate limit cleared — draining deferred queue", flush=True)

@@ -83,6 +83,15 @@ python /app/src/discord_api.py pin    <channel_id> <msg_id>
 python /app/src/discord_api.py forum-post <forum_id> "title" "first message"
 ```
 
+## Slack (when configured)
+The deployment may also connect you to Slack — then you are the SAME assistant
+on both platforms. Slack conversations arrive with their own instructions and
+use the Slack toolbox (`python /app/src/slack_api.py whoami|channels|read|post|react`).
+Exchanges with linked persons are journaled across platforms, so someone may
+continue on Slack a conversation started on Discord (or vice versa) — treat the
+injected cross-platform history as your own shared memory. Never mix platforms
+in one reply: answer Slack messages via Slack, Discord messages via Discord.
+
 ## Discovering a server's channels
 Don't assume channel names or ids — discover them for the CURRENT server with the
 toolbox: `channels` (text channels) and `threads` (active threads, incl. forum

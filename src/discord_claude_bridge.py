@@ -161,6 +161,70 @@ ALLOWED_USER_IDS = {x.strip() for x in allowed_raw.split(",") if x.strip()}
 # bypasses per-server isolation). Empty = no DM has cross-server access.
 OWNER_IDS = {x.strip() for x in os.environ.get("BOT_OWNER_IDS", "").split(",") if x.strip()}
 
+# Cross-platform person links — the SAME human on different platforms:
+#   USER_LINKS=vincent=discord:715003091371687986+slack:U0AAAAAA,jane=discord:999
+# ("," between persons, "=" name/ids, "+" between platform:id pairs.)
+# Powers the shared cross-platform memory (crossctx): every exchange with a
+# linked person is journaled per PERSON, and when that person talks to the bot
+# on another platform/channel the recent journal is injected — so Slack-you and
+# Discord-you are talking to one continuous assistant.
+USER_LINKS = {}
+for _p in os.environ.get("USER_LINKS", "").split(","):
+    _p = _p.strip()
+    if not _p or "=" not in _p:
+        continue
+    _name, _ids = _p.split("=", 1)
+    for _tok in _ids.split("+"):
+        if ":" in _tok:
+            _plat, _uid = _tok.split(":", 1)
+            USER_LINKS[(_plat.strip(), _uid.strip())] = _name.strip()
+
+CROSSCTX_DIR = os.path.join(WORKSPACE, "crossctx")
+CROSSCTX_MAX = int(os.environ.get("CROSSCTX_MAX", "10"))
+
+
+def person_for(platform, user_id):
+    return USER_LINKS.get((platform, str(user_id)))
+
+
+def log_crossctx(person, platform, channel, ask, reply):
+    """Append one exchange to the person's cross-platform journal."""
+    if not person:
+        return
+    try:
+        os.makedirs(CROSSCTX_DIR, exist_ok=True)
+        rec = {"ts": round(time.time()), "platform": platform, "channel": str(channel),
+               "ask": (ask or "")[:400], "reply": (reply or "")[:400]}
+        with open(os.path.join(CROSSCTX_DIR, f"{person}.jsonl"), "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def crossctx_block(person, platform, channel):
+    """Recent exchanges with this person on OTHER channels/platforms, as a prompt
+    block — the person may refer back to them ("continue what we discussed on
+    Slack"), so the bot answers as one continuous assistant."""
+    if not person:
+        return ""
+    try:
+        with open(os.path.join(CROSSCTX_DIR, f"{person}.jsonl")) as f:
+            rows = [json.loads(ln) for ln in f if ln.strip()]
+    except Exception:
+        return ""
+    rows = [r for r in rows
+            if not (r.get("platform") == platform and r.get("channel") == str(channel))]
+    if not rows:
+        return ""
+    lines = []
+    for r in rows[-CROSSCTX_MAX:]:
+        t = time.strftime("%m-%d %H:%M", time.localtime(r.get("ts") or 0))
+        lines.append(f"[{t} · {r.get('platform')}] {person}: {r.get('ask')}\n  you: {r.get('reply')}")
+    return ("Recent exchanges you had with this SAME person elsewhere (they may be on "
+            "Discord or Slack — you are ONE continuous assistant across both; treat "
+            "these as shared memory the person may refer back to):\n"
+            + "\n".join(lines) + "\n\n")
+
 # Anti-loop for bot↔bot @-mention ping-pong. Discord marks bot/webhook authors
 # with author.bot == true, so we can tell them apart from humans.
 #
@@ -1387,13 +1451,16 @@ def _stream_claude(cmd, cwd, env, run_id):
     return _Res(proc.returncode, json.dumps(final) if final else "", stderr)
 
 
-def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=False, owner_dm=False):
+def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=False,
+               owner_dm=False, extra_context="", instruction=None):
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
         if history
         else ""
     )
-    if owner_dm:
+    if instruction is not None:
+        pass  # caller-built (e.g. the Slack bridge) — use as-is
+    elif owner_dm:
         # Owner DM = privileged cross-server debug/control channel. The normal
         # per-server "stay in your lane" isolation is deliberately lifted here.
         instruction = (
@@ -1411,7 +1478,7 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=Fals
             f"(`python /app/src/discord_api.py post {channel_id} \"...\"`); the bridge "
             "only posts your final answer.\n\n"
             f"Sender (owner): {author}\nThis DM channel: {channel_id}\n\n"
-            f"{context_block}New Message:\n{prompt}"
+            f"{extra_context}{context_block}New Message:\n{prompt}"
         )
     else:
         where = "a private direct message (DM)" if is_dm else "a Discord message in this server"
@@ -1439,7 +1506,7 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=Fals
             f"(`python /app/src/discord_api.py post {channel_id} \"...\"`); the bridge "
             "only posts your final answer.\n\n"
             f"Sender: {author}\nThis channel: {channel_id}\n\n"
-            f"{context_block}New Message:\n{prompt}"
+            f"{extra_context}{context_block}New Message:\n{prompt}"
         )
     if STREAM_TELEMETRY:
         base = [CLAUDE_BIN, "-p", "--permission-mode", PERMISSION_MODE,
@@ -1604,7 +1671,10 @@ def handle_message(channel_id, msg, is_dm=False):
         guild_id = msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id))
     # A DM from a configured owner is the privileged cross-server debug channel.
     owner_dm = is_dm and author_id in OWNER_IDS
+    # Cross-platform continuity: who is this, across platforms?
+    person = person_for("discord", author_id)
     prompt = clean_prompt(content)
+    journal_ask = prompt  # clean ask, before decorations — for the person journal
     low = prompt.strip().lower()
     # Built-in commands (no Claude run).
     if low in ("/reset", "/new", "reset session"):
@@ -1667,10 +1737,15 @@ def handle_message(channel_id, msg, is_dm=False):
                 print(f"[bridge] history fetch failed: {exc}", flush=True)
                 history = ""
             try:
-                reply = run_claude(author.get("username", author_id), channel_id, prompt, history, guild_id, is_dm, owner_dm)
+                # Inject the person's cross-platform memory in DMs only — a public
+                # server reply must never surface private DM/Slack content.
+                extra = crossctx_block(person, "discord", channel_id) if (person and is_dm) else ""
+                reply = run_claude(author.get("username", author_id), channel_id, prompt,
+                                   history, guild_id, is_dm, owner_dm, extra_context=extra)
                 # The session now knows up to this message — next turn injects only
                 # what arrives after it (no re-feeding, no gaps).
                 set_context_cursor(channel_id, msg["id"])
+                log_crossctx(person, "discord", channel_id, journal_ask, reply)
             except RateLimited as rl:
                 # Hit the limit mid-flight — queue it and tell the user it'll auto-resume.
                 defer_message(channel_id, msg, prompt)
