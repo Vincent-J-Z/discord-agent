@@ -1529,6 +1529,11 @@ def handle_message(channel_id, msg, is_dm=False):
         return
     if ALLOWED_USER_IDS and author_id not in ALLOWED_USER_IDS:
         return
+    # DMs are owner-only (the privileged debug channel): silently ignore DMs from
+    # anyone else. Server channels are NOT affected — everyone (incl. other bots)
+    # can @ the bot there as usual.
+    if is_dm and author_id not in OWNER_IDS:
+        return
     content = msg.get("content", "") or ""
     # In a DM every message is directed at the bot, so no @-mention is required;
     # in a guild channel we still only act when explicitly addressed.
