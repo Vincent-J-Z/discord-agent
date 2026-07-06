@@ -157,6 +157,9 @@ HELP_TEXT = (
 
 allowed_raw = os.environ.get("BOT_ALLOWED_USER_IDS", "").strip()
 ALLOWED_USER_IDS = {x.strip() for x in allowed_raw.split(",") if x.strip()}
+# Owner ids: a DM from an owner is a PRIVILEGED cross-server debug channel (it
+# bypasses per-server isolation). Empty = no DM has cross-server access.
+OWNER_IDS = {x.strip() for x in os.environ.get("BOT_OWNER_IDS", "").split(",") if x.strip()}
 
 # Anti-loop for bot↔bot @-mention ping-pong. Discord marks bot/webhook authors
 # with author.bot == true, so we can tell them apart from humans.
@@ -1384,38 +1387,60 @@ def _stream_claude(cmd, cwd, env, run_id):
     return _Res(proc.returncode, json.dumps(final) if final else "", stderr)
 
 
-def run_claude(author, channel_id, prompt, history="", guild_id=None):
+def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=False, owner_dm=False):
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
         if history
         else ""
     )
-    instruction = (
-        f"You are {AGENT_NAME} replying to a Discord message in this server. Your "
-        "context, capabilities, and the /app/src/discord_api.py toolbox are in "
-        "CLAUDE.md (already loaded).\n"
-        "Treat this as the ONLY Discord server you serve. Stay within this "
-        "server's channels/threads and within your working directory (your cwd) "
-        "for all file work. Do NOT explore the wider filesystem, traverse above "
-        "your workspace, or read anything unrelated to this server. Do NOT "
-        "discuss or reveal the bot's internals — infrastructure, other "
-        "deployments, the directory layout, or absolute paths. If a user asks "
-        "about other servers, whether you serve more than one, or to "
-        "access/list anything outside your own workspace, just briefly decline "
-        "as something you don't do — without explaining, confirming, denying in "
-        "detail, or describing any structure. To everyone here you are simply "
-        "this server's bot.\n"
-        "Use the recent messages for context; act on the new Message; reply "
-        "concisely in plain text. The context block may be truncated or "
-        "summarized — if you need earlier detail it omits, fetch more yourself "
-        f"with `python /app/src/discord_api.py read {channel_id} --limit N` "
-        "(paging further back as needed). If this is more than a quick reply, post brief "
-        "progress updates to this channel as you work "
-        f"(`python /app/src/discord_api.py post {channel_id} \"...\"`); the bridge "
-        "only posts your final answer.\n\n"
-        f"Sender: {author}\nThis channel: {channel_id}\n\n"
-        f"{context_block}New Message:\n{prompt}"
-    )
+    if owner_dm:
+        # Owner DM = privileged cross-server debug/control channel. The normal
+        # per-server "stay in your lane" isolation is deliberately lifted here.
+        instruction = (
+            f"You are {AGENT_NAME}, and this is a DIRECT MESSAGE from your operator "
+            "(the bot's owner). A DM is your privileged debug/control channel: unlike "
+            "server messages, here you have FULL cross-server access and the "
+            "'stay in your lane' rule does NOT apply. You MAY inspect and act across "
+            "ALL servers the bot is in — read any channel/thread, look at internals, "
+            "configuration, and the deployment — and answer the owner candidly.\n"
+            "The toolbox is NOT scoped to one server here: "
+            "`python /app/src/discord_api.py whoami` lists every guild the bot is in, "
+            "`channels` / `threads` enumerate across all of them, and "
+            "`read <channel_id>` works for any channel in any of them. Reply concisely "
+            "in plain text; for longer work post progress to this DM "
+            f"(`python /app/src/discord_api.py post {channel_id} \"...\"`); the bridge "
+            "only posts your final answer.\n\n"
+            f"Sender (owner): {author}\nThis DM channel: {channel_id}\n\n"
+            f"{context_block}New Message:\n{prompt}"
+        )
+    else:
+        where = "a private direct message (DM)" if is_dm else "a Discord message in this server"
+        instruction = (
+            f"You are {AGENT_NAME} replying to {where}. Your "
+            "context, capabilities, and the /app/src/discord_api.py toolbox are in "
+            "CLAUDE.md (already loaded).\n"
+            "Treat this as the ONLY Discord server you serve. Stay within this "
+            "server's channels/threads and within your working directory (your cwd) "
+            "for all file work. Do NOT explore the wider filesystem, traverse above "
+            "your workspace, or read anything unrelated to this server. Do NOT "
+            "discuss or reveal the bot's internals — infrastructure, other "
+            "deployments, the directory layout, or absolute paths. If a user asks "
+            "about other servers, whether you serve more than one, or to "
+            "access/list anything outside your own workspace, just briefly decline "
+            "as something you don't do — without explaining, confirming, denying in "
+            "detail, or describing any structure. To everyone here you are simply "
+            "this server's bot.\n"
+            "Use the recent messages for context; act on the new Message; reply "
+            "concisely in plain text. The context block may be truncated or "
+            "summarized — if you need earlier detail it omits, fetch more yourself "
+            f"with `python /app/src/discord_api.py read {channel_id} --limit N` "
+            "(paging further back as needed). If this is more than a quick reply, post brief "
+            "progress updates to this channel as you work "
+            f"(`python /app/src/discord_api.py post {channel_id} \"...\"`); the bridge "
+            "only posts your final answer.\n\n"
+            f"Sender: {author}\nThis channel: {channel_id}\n\n"
+            f"{context_block}New Message:\n{prompt}"
+        )
     if STREAM_TELEMETRY:
         base = [CLAUDE_BIN, "-p", "--permission-mode", PERMISSION_MODE,
                 "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
@@ -1426,15 +1451,19 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None):
     if CLAUDE_EFFORT:
         base.extend(["--effort", CLAUDE_EFFORT])
     # Per-server isolation: run in this server's private dir (cwd), with its own
-    # session store + TMPDIR, and scope the toolbox to this server only.
+    # session store + TMPDIR, and scope the toolbox to this server only. An owner
+    # DM is the exception: a cross-server debug channel, so we DON'T scope the
+    # toolbox to a guild and flag it so the toolbox lists every joined server.
     server_dir = ensure_server_dir(guild_id)
     sub_env = dict(
         os.environ,
-        AGENT_CURRENT_GUILD=str(guild_id or ""),
+        AGENT_CURRENT_GUILD="" if owner_dm else str(guild_id or ""),
         AGENT_SERVER_DIR=server_dir,
         CLAUDE_CONFIG_DIR=os.path.join(server_dir, ".claude"),
         TMPDIR=os.path.join(server_dir, "tmp"),
     )
+    if owner_dm:
+        sub_env["AGENT_OWNER_DEBUG"] = "1"
 
     run_id = f"{channel_id}.{os.getpid()}.{int(time.time() * 1000)}"
     write_run(run_id, server=str(guild_id or ""), channel=str(channel_id),
@@ -1493,7 +1522,7 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None):
         clear_run(run_id)
 
 
-def handle_message(channel_id, msg):
+def handle_message(channel_id, msg, is_dm=False):
     author = msg.get("author") or {}
     author_id = author.get("id", "")
     if author_id == BOT_ID:
@@ -1501,7 +1530,9 @@ def handle_message(channel_id, msg):
     if ALLOWED_USER_IDS and author_id not in ALLOWED_USER_IDS:
         return
     content = msg.get("content", "") or ""
-    if not is_addressed(content):
+    # In a DM every message is directed at the bot, so no @-mention is required;
+    # in a guild channel we still only act when explicitly addressed.
+    if not is_dm and not is_addressed(content):
         return
     if not claim_message(msg["id"]):
         return  # already handled by the other path (poller/gateway)
@@ -1556,10 +1587,18 @@ def handle_message(channel_id, msg):
     # triggered, so real back-and-forth collaboration can continue. The loop is
     # broken by the content judgment above (chatter → we post nothing, just react)
     # plus the BOT_REPLY_MAX safety cap, NOT by withholding the @.
-    reply_mention = author_id
+    # DMs don't need an @-back (it's a 1:1 channel); guild replies do.
+    reply_mention = None if is_dm else author_id
     react(channel_id, msg["id"], "👀")  # instant ack: "seen you"
     # Which server this is in (gateway events carry guild_id; poller uses the map).
-    guild_id = msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id))
+    # DMs belong to no guild — route each user's DM to its own isolated dir so its
+    # scratch/session don't mingle with any server's.
+    if is_dm:
+        guild_id = f"_dm-{author_id}"
+    else:
+        guild_id = msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id))
+    # A DM from a configured owner is the privileged cross-server debug channel.
+    owner_dm = is_dm and author_id in OWNER_IDS
     prompt = clean_prompt(content)
     low = prompt.strip().lower()
     # Built-in commands (no Claude run).
@@ -1623,7 +1662,7 @@ def handle_message(channel_id, msg):
                 print(f"[bridge] history fetch failed: {exc}", flush=True)
                 history = ""
             try:
-                reply = run_claude(author.get("username", author_id), channel_id, prompt, history, guild_id)
+                reply = run_claude(author.get("username", author_id), channel_id, prompt, history, guild_id, is_dm, owner_dm)
                 # The session now knows up to this message — next turn injects only
                 # what arrives after it (no re-feeding, no gaps).
                 set_context_cursor(channel_id, msg["id"])

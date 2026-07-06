@@ -50,16 +50,24 @@ def _req(method, path, **kw):
     return r
 
 
+def _all_joined():
+    return [(str(g["id"]), g.get("name")) for g in _req("GET", "/users/@me/guilds", headers=H).json()]
+
+
 def _guilds():
-    # During message handling the bridge sets AGENT_CURRENT_GUILD so the toolbox
-    # is scoped to ONLY the current server (server isolation — never expose other
-    # servers' channels/threads here).
+    # Owner DM (privileged debug channel): the bridge sets AGENT_OWNER_DEBUG — full
+    # cross-server access, so enumerate EVERY guild the bot has joined.
+    if os.environ.get("AGENT_OWNER_DEBUG") == "1":
+        return _all_joined()
+    # Otherwise the bridge sets AGENT_CURRENT_GUILD so the toolbox is scoped to
+    # ONLY the current server (server isolation — never expose other servers'
+    # channels/threads here).
     current = os.environ.get("AGENT_CURRENT_GUILD", "").strip()
     if current:
         return [(current, None)]
     if GUILDS:
         return [(g, None) for g in GUILDS]
-    return [(str(g["id"]), g.get("name")) for g in _req("GET", "/users/@me/guilds", headers=H).json()]
+    return _all_joined()
 
 
 def whoami(_):

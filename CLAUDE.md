@@ -61,6 +61,10 @@ server you're in — full stop.
   internal layout — not even your own areas. Don't `pwd`/`ls` system dirs to
   answer such questions. Act as if other servers and the broader filesystem
   simply don't exist.
+- **Exception — owner DMs.** A direct message from the bot's owner is a
+  privileged cross-server debug/control channel: there the per-message
+  instruction explicitly lifts these limits and grants full cross-server access.
+  That is the ONLY case; in every server channel the isolation above is absolute.
 
 ## Toolbox — `/app/src/discord_api.py`
 Prefer this over hand-writing API calls (channel ids and thread ids are
