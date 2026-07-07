@@ -46,6 +46,9 @@ POOL = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
 
 # Persons linked to a Discord owner id are owners here too (same human).
 OWNER_PERSONS = {p for p in (b.person_for("discord", oid) for oid in b.OWNER_IDS) if p}
+# Slack uids of those owners — so we can DM the operator a heads-up.
+OWNER_SLACK_IDS = {uid for (plat, uid), name in b.USER_LINKS.items()
+                   if plat == "slack" and name in OWNER_PERSONS}
 
 SELF_ID = None
 _user_cache = {}
@@ -97,6 +100,52 @@ def react(channel, ts, name):
         pass  # already_reacted etc. — cosmetic
 
 
+def unreact(channel, ts, name):
+    try:
+        api("reactions.remove", channel=channel, timestamp=ts, name=name)
+    except Exception:
+        pass  # no_reaction etc. — cosmetic
+
+
+def set_status(channel, ts, done, old="eyes"):
+    """Swap the trigger message's status reaction: 👀 while working →
+    ✅ done / ⚠️ error. Keeps the outcome on the message, out of the reply text."""
+    unreact(channel, ts, old)
+    react(channel, ts, "white_check_mark" if done else "warning")
+
+
+def download_images(ev):
+    """Download image attachments of a Slack message to the slack workdir and
+    return their local absolute paths, so the agent can Read them (Claude is
+    multimodal). Non-image files are skipped. Requires the files:read scope."""
+    files = ev.get("files") or []
+    if not files:
+        return []
+    media_dir = os.path.join(b.ensure_server_dir("_slack"), "tmp", "slack_media")
+    os.makedirs(media_dir, exist_ok=True)
+    paths = []
+    for f in files:
+        mt = f.get("mimetype") or ""
+        url = f.get("url_private_download") or f.get("url_private")
+        if not mt.startswith("image/") or not url:
+            continue
+        ext = (f.get("filetype") or "png").split("?")[0][:5] or "png"
+        dest = os.path.join(media_dir, f"{f.get('id', 'img')}.{ext}")
+        try:
+            r = httpx.get(url, headers={"Authorization": f"Bearer {BOT_TOKEN}"},
+                          timeout=30, follow_redirects=True)
+            # a token/scope failure returns an HTML login page, not the image
+            if r.status_code == 200 and not r.content[:15].lstrip().lower().startswith(b"<!doctype"):
+                with open(dest, "wb") as fh:
+                    fh.write(r.content)
+                paths.append(dest)
+            else:
+                print(f"[slack] image fetch not an image (status {r.status_code})", flush=True)
+        except Exception as exc:
+            print(f"[slack] image download failed: {exc}", flush=True)
+    return paths
+
+
 def fetch_history(channel, before_ts):
     """Recent messages (oldest first) for context, excluding the trigger itself."""
     try:
@@ -106,16 +155,21 @@ def fetch_history(channel, before_ts):
         return ""
     lines = []
     for m in sorted(d.get("messages", []), key=lambda x: float(x.get("ts", 0))):
-        if m.get("ts") == before_ts or m.get("subtype"):
+        st = m.get("subtype")
+        if m.get("ts") == before_ts or (st and st != "file_share"):
             continue
         body = " ".join((m.get("text") or "").split())
+        if m.get("files"):
+            imgs = sum(1 for f in m["files"] if (f.get("mimetype") or "").startswith("image/"))
+            if imgs:
+                body = (body + f" [附{imgs}张图片]").strip()
         if not body:
             continue
         lines.append(f"[{user_name(m.get('user') or m.get('bot_id'))}] {body[:500]}")
     return "\n".join(lines[-HISTORY_LIMIT:])
 
 
-def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_dm):
+def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_dm, images=None):
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
         if history else ""
@@ -150,17 +204,42 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
         "Use the recent messages for context; act on the new Message; reply "
         "concisely in plain text. For longer work, post brief progress updates "
         f"as you go (`python /app/src/slack_api.py post {channel} \"...\"`); the "
-        "bridge only posts your final answer."
+        "bridge only posts your final answer. Do NOT put a status/done checkmark "
+        "(✅) in your reply text — the bridge already signals completion by "
+        "swapping the 👀 reaction on the user's message to ✅. Keep the prose free "
+        "of status emoji."
     )
+    img_block = ""
+    if images:
+        img_block = (
+            f"\n\n[发信人上传了 {len(images)} 张图片,已下载到本地。用 Read 工具"
+            "查看下列绝对路径的图片,把图片内容纳入你的回答:\n"
+            + "\n".join(f"- {p}" for p in images) + "\n]"
+        )
     return ("\n".join(lines)
             + f"\n\nSender: {author}\nThis Slack channel: {channel}\n\n"
-            + f"{crossctx}{context_block}New Message:\n{prompt}")
+            + f"{crossctx}{context_block}New Message:\n{prompt}{img_block}")
+
+
+def notify_owner_of_dm(from_uid, from_name, text):
+    """A non-owner DM'd the bot — forward a heads-up to the operator(s), then
+    stay silent to the sender (DMs remain owner-only)."""
+    body = " ".join((text or "").split())[:500] or "(空消息)"
+    for oid in OWNER_SLACK_IDS:
+        if oid == from_uid:
+            continue
+        try:
+            ch = api("conversations.open", users=oid)["channel"]["id"]
+            post(ch, f"📩 *{from_name}* (`{from_uid}`) 私信了我(非 owner,我未回复):\n> {body}")
+        except Exception as exc:
+            print(f"[slack] owner-notify failed: {exc}", flush=True)
 
 
 def handle(ev, is_dm):
     channel, user, ts = ev["channel"], ev["user"], ev["ts"]
     person = b.person_for("slack", user)
     if is_dm and person not in OWNER_PERSONS:
+        notify_owner_of_dm(user, user_name(user), ev.get("text") or "")
         return  # DMs are owner-only, same policy as Discord
     text = re.sub(rf"<@{SELF_ID}>", "", ev.get("text") or "").strip()
     author = user_name(user)
@@ -168,34 +247,44 @@ def handle(ev, is_dm):
     thread_ts = ev.get("thread_ts")  # reply in-thread only if asked in a thread
     react(channel, ts, "eyes")
     if b.is_limited():
+        set_status(channel, ts, done=False)
         post(channel, f"⏳ Claude 额度暂时用满,约 {b.fmt_utc(b.limited_until())} 恢复。", thread_ts)
         return
+    images = download_images(ev)
     if not text:
-        text = "The user only mentioned you without extra text. Reply briefly and ask what they need."
-    print(f"[slack] handling {ts} in {channel} from {author}", flush=True)
+        text = ("The user sent image(s) with no text — look at the attached image(s) and respond."
+                if images else
+                "The user only mentioned you without extra text. Reply briefly and ask what they need.")
+    print(f"[slack] handling {ts} in {channel} from {author} ({len(images)} img)", flush=True)
     history = fetch_history(channel, ts)
     crossctx = b.crossctx_block(person, "slack", channel)
-    instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm)
+    instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm, images)
     key = f"slack:{channel}"
     try:
         with b.channel_lock(key):
             reply = b.run_claude(author, key, text, guild_id="_slack",
                                  is_dm=is_dm, owner_dm=owner_dm, instruction=instruction)
     except b.RateLimited as rl:
+        set_status(channel, ts, done=False)
         post(channel, f"⏳ Claude 额度用满,约 {b.fmt_utc(rl.reset)} 恢复。", thread_ts)
         return
     except Exception as exc:
         print(f"[slack] handler error in {channel}: {exc}", flush=True)
+        set_status(channel, ts, done=False)
         post(channel, f"⚠️ bridge error: {str(exc)[:300]}", thread_ts)
         return
     post(channel, reply, thread_ts)
+    set_status(channel, ts, done=True)
     b.log_crossctx(person, "slack", channel, text, reply)
 
 
 def on_event(ev):
     et = ev.get("type")
-    if ev.get("bot_id") or ev.get("subtype"):
-        return  # other bots, edits, joins, …
+    print(f"[slack] event: {et} ch={ev.get('channel')} user={ev.get('user')} "
+          f"subtype={ev.get('subtype')}", flush=True)
+    subtype = ev.get("subtype")
+    if ev.get("bot_id") or (subtype and subtype != "file_share"):
+        return  # other bots, edits, joins, … — but keep file_share (image uploads)
     user = ev.get("user")
     if not user or user == SELF_ID:
         return

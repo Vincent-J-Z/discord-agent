@@ -113,6 +113,24 @@ env, and resource limits (defaults 6 CPU / 6 GB — override with `AGENT_CPUS` /
 `DISCORD_AGENT_SOURCE_HOST` / `DISCORD_AGENT_WORKSPACE_HOST` override the mounted
 paths (default: the repo dir and `~/discordAgentWorkspace`).
 
+### 7b. Run with Docker instead (Linux servers)
+The `Containerfile` is a standard Dockerfile; `compose.yaml` is the Docker twin
+of `run-container.sh` (same two mounts, auto-restart on reboot):
+```bash
+DISCORD_AGENT_SOURCE_HOST="$PWD" \
+DISCORD_AGENT_WORKSPACE_HOST="$HOME/discordAgentWorkspace" \
+docker compose up -d --build
+```
+The container runs as uid 10001 (`agent`) — make both host dirs writable by it
+(`sudo chown -R 10001 <repo> <workspace>`).
+
+**Migrating an existing deployment to a Docker host:** `./migrate-docker.sh
+<ssh-host>` rsyncs the repo (incl. the gitignored `.env` / `CLAUDE.local.md`)
+and the whole workspace (tokens, per-server sessions, crossctx, sub-agent
+state) to the remote host, builds, and starts it. One bot token = one live
+instance — stop the old one after verifying the new (the script prints the
+exact cutover commands).
+
 ---
 
 ## 8. Auto-start on login (survive reboots)
