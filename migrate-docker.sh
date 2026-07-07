@@ -37,13 +37,12 @@ rsync -az --delete \
 echo "==> syncing workspace ($(du -sh "$WORKSPACE" | cut -f1)) -> $HOST:$BASE/workspace"
 rsync -az --delete --exclude 'tmp/' "$WORKSPACE/" "$HOST:$BASE/workspace/"
 
-echo "==> remote: permissions (container runs as uid 10001), build & start"
+echo "==> remote: build (agent uid = remote uid, so no chown/sudo needed) & start"
 ssh "$HOST" "set -e
   cd '$BASE'
   mkdir -p workspace/tmp
-  sudo -n chown -R 10001 app workspace 2>/dev/null \
-    || echo '   (could not chown to uid 10001 without sudo — if the container fails to write, run: sudo chown -R 10001 \$PWD/app \$PWD/workspace)'
   cd app
+  AGENT_UID=\"\$(id -u)\" \
   DISCORD_AGENT_SOURCE_HOST=\"\$PWD\" \
   DISCORD_AGENT_WORKSPACE_HOST=\"\$PWD/../workspace\" \
   docker compose up -d --build

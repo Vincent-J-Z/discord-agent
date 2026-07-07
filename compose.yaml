@@ -17,6 +17,9 @@ services:
     build:
       context: .
       dockerfile: Containerfile
+      args:
+        # Match the owner of the bind-mounted dirs: AGENT_UID=$(id -u)
+        AGENT_UID: ${AGENT_UID:-10001}
     image: discord-agent:local
     container_name: discord-agent
     working_dir: /app

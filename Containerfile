@@ -39,7 +39,11 @@ RUN python -m pip install --upgrade pip \
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && claude --version
 
-RUN useradd --create-home --uid 10001 agent
+# The agent's uid is configurable so it can match the OWNER of the bind-mounted
+# host dirs (no sudo/chown needed on the host): build with
+#   --build-arg AGENT_UID=$(id -u)
+ARG AGENT_UID=10001
+RUN useradd --create-home --uid ${AGENT_UID} agent
 
 # Let the agent install whatever a task needs (apt/pip/npm) without a rebuild.
 # Passwordless sudo is acceptable because the container is the isolation
