@@ -33,6 +33,10 @@ services:
       HOME: /home/agent
       TMPDIR: /workspace/tmp
       CLAUDE_CWD: /app
+    # Make the Docker host reachable from inside as `host.docker.internal`
+    # (e.g. to let the agent ssh to its own host machine).
+    extra_hosts:
+      - host.docker.internal:host-gateway
     volumes:
       - ${DISCORD_AGENT_SOURCE_HOST:-.}:/app
       - ${DISCORD_AGENT_WORKSPACE_HOST:-${HOME}/discordAgentWorkspace}:/workspace
