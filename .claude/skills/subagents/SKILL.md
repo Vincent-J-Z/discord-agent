@@ -31,9 +31,11 @@ python /app/src/subagent.py claude <name> "<task brief>" \
 ```
 
 Write the brief like a real handoff: goal, context (paths, prior findings),
-constraints, definition of done, and an explicit "post progress AND the FULL
-final result to channel <id> with (discord|slack)_api.py". A worker reporting
-its own progress is how the user sees movement while it runs.
+constraints, definition of done. The worker reports back to YOU (the dispatcher),
+NOT to the user — so it should produce a clear final result and leave progress
+notes in its own output; do NOT tell it to post to the channel. With `--report`,
+when it finishes the runtime wakes the dispatcher to narrate the outcome to the
+user in the dispatcher's own voice (one assistant, one voice).
 
 Interactive `claude` REPLs can't be workers in this deployment — they demand an
 interactive `/login` (headless auth via env token isn't honored in the TUI).

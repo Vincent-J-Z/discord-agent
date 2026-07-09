@@ -134,13 +134,14 @@ def _write_runenv(path):
     os.replace(tmp, path)
 
 
-def _write_runner(command, name, channel, report, claude_json=False):
-    """Write a runner script that records the command's exit code and optionally
-    posts a result line to the channel on finish. tmux runs `bash <script>` —
-    keeping the body in a file avoids all the quoting pitfalls.
-    claude_json=True: the command is a headless `claude -p --output-format json`;
-    the runner captures its session_id (for later `steer`/resume) and reports the
-    parsed `result` text rather than a raw log tail."""
+def _write_runner(command, name, channel, report, claude_json=False, note=""):
+    """Write a runner script that records the command's exit code and, when
+    reporting, hands the result to the DISPATCHER (the channel agent) rather than
+    posting to the channel itself: it drops a file in /workspace/.worker_reports/
+    that the runtime picks up to wake the dispatcher, who narrates the outcome to
+    the user in its own voice. tmux runs `bash <script>` (a file avoids quoting
+    pitfalls). claude_json=True captures the worker's session_id (for `steer`)
+    and its parsed result text."""
     log = _log_path(name)
     done = os.path.join(STATE_DIR, name + ".exit")
     # tmux is a persistent daemon: a new session inherits the env the tmux SERVER
@@ -166,26 +167,22 @@ def _write_runner(command, name, channel, report, claude_json=False):
             f"open({_pyq(log)}+'.result','w').write(d.get('result') or '')\" 2>/dev/null || true"
         )
     if report and channel:
-        # Platform-aware: Slack channel ids are C…/D…/G… (alnum), Discord ids are
-        # numeric snowflakes — report through the matching toolbox, else the post
-        # silently 404s and the job's result never reaches the user.
-        ch = str(channel)
-        tool = "discord_api.py" if ch.isdigit() else "slack_api.py"
-        api = shlex.quote(os.path.join(ROOT, tool))
-        prefix = shlex.quote(f"🤖 worker `{name}` finished (exit ")
-        if claude_json:
-            # Report the actual answer text; fall back to a log tail if empty.
-            body_src = (f"BODY=$(cut -c1-1600 {shlex.quote(log)}.result 2>/dev/null); "
-                        f"[ -z \"$BODY\" ] && BODY=$(tail -n 3 {shlex.quote(log)} 2>/dev/null "
-                        f"| tr '\\n\\r\\t' '   ' | cut -c1-300)")
-        else:
-            body_src = (f"BODY=$(tail -n 3 {shlex.quote(log)} 2>/dev/null "
-                        f"| tr '\\n\\r\\t' '   ' | cut -c1-300)")
+        # Hand the result to the dispatcher (do NOT post to the channel here).
+        reports = os.path.join(WORKSPACE, ".worker_reports")
+        pend = os.path.join(reports, name + ".json")
+        resultfile = log + ".result" if claude_json else ""
         lines += [
-            f"EXIT=$(cat {shlex.quote(done)} 2>/dev/null)",
-            body_src,
-            f'MSG="$(printf \'%s%s):\\n%s\' {prefix} "$EXIT" "$BODY")"',
-            f'python {api} post {shlex.quote(str(channel))} "$MSG" >/dev/null 2>&1 || true',
+            f"mkdir -p {shlex.quote(reports)}",
+            "python3 -c \""
+            "import json,os;"
+            f"rf={_pyq(resultfile)};"
+            f"res=(open(rf).read()[:6000] if rf and os.path.exists(rf) else "
+            f"open({_pyq(log)}).read()[-2000:] if os.path.exists({_pyq(log)}) else '');"
+            "json.dump({"
+            f"'channel':{_pyq(str(channel))},'name':{_pyq(name)},'note':{_pyq(note or '')},"
+            f"'exit':(open({_pyq(done)}).read().strip() if os.path.exists({_pyq(done)}) else '?'),"
+            "'result':res,'ts':__import__('time').time()},"
+            f"open({_pyq(pend)},'w'),ensure_ascii=False)\" 2>/dev/null || true",
         ]
     lines.append("sleep 2")  # keep the pane briefly so `logs` works right after exit
     path = os.path.join(STATE_DIR, name + ".sh")
@@ -212,7 +209,8 @@ def cmd_spawn(a):
     except OSError:
         pass
     runner = _write_runner(command, name, a.channel, a.report,
-                           claude_json=getattr(a, "_claude_json", False))
+                           claude_json=getattr(a, "_claude_json", False),
+                           note=getattr(a, "note", ""))
     cwd = a.cwd or ROOT
     r = _tmux("new-session", "-d", "-s", _sess(name), "-c", cwd, "bash", runner)
     if r.returncode != 0:

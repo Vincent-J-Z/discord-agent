@@ -50,6 +50,24 @@ LAST_SWEEP_FILE = os.path.join(WORKSPACE, ".last_sweep")
 ACTIVITY_FILE = os.path.join(WORKSPACE, ".activity")
 LIMITED_FILE = os.path.join(WORKSPACE, ".limited_until")
 DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred")
+REPORTS_DIR = os.path.join(WORKSPACE, ".worker_reports")
+
+
+def _not_limited():
+    try:
+        with open(LIMITED_FILE) as f:
+            return time.time() >= float(f.read().strip())
+    except Exception:
+        return True
+
+
+def _reports_due():
+    """A finished worker left a report for the dispatcher to narrate."""
+    try:
+        pending = any(n.endswith(".json") for n in os.listdir(REPORTS_DIR))
+    except FileNotFoundError:
+        return False
+    return pending and _not_limited()
 
 
 def _resume_due():
@@ -147,6 +165,7 @@ def main():
         _mark_sweep()  # don't sweep the instant we boot; first sweep one interval later
     sweep = None
     resume = None
+    report = None
     try:
         while bridge.poll() is None:
             if gateway.poll() is not None:
@@ -159,6 +178,10 @@ def main():
             if (resume is None or resume.poll() is not None) and _resume_due():
                 print("[runtime] rate limit cleared — draining deferred queue", flush=True)
                 resume = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_resume.py")])
+            # A finished worker left a report — wake the dispatcher to narrate it.
+            if (report is None or report.poll() is not None) and _reports_due():
+                print("[runtime] worker report(s) pending — narrating", flush=True)
+                report = subprocess.Popen([sys.executable, os.path.join(ROOT, "worker_report.py")])
             # Proactive review — activity-driven + hourly fallback, only if the
             # previous one has finished.
             if (sweep is None or sweep.poll() is not None) and _sweep_due():
