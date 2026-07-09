@@ -80,17 +80,39 @@ def user_name(uid):
 
 
 def post(channel, text, thread_ts=None):
+    """Deliver text COMPLETELY: chunked to Slack size, paced under Slack's
+    ~1 msg/sec/channel limit, retrying rate-limits — a failed chunk never
+    silently drops the rest (that's how replies got 'swallowed')."""
     text = (text or "").strip() or "(no output)"
-    while text:
-        chunk, text = text[:3900], text[3900:]
+    chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)]
+    dropped = 0
+    for i, chunk in enumerate(chunks):
+        if i:
+            time.sleep(1.2)  # pace multi-chunk sends under the per-channel limit
         kw = {"channel": channel, "text": chunk}
         if thread_ts:
             kw["thread_ts"] = thread_ts
+        sent = False
+        for attempt in range(4):
+            try:
+                api("chat.postMessage", **kw)
+                sent = True
+                break
+            except Exception as exc:
+                if "ratelimited" in str(exc) or "rate_limited" in str(exc):
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                print(f"[slack] post failed in {channel}: {exc}", flush=True)
+                break
+        if not sent:
+            dropped += 1
+            print(f"[slack] DROPPED chunk {i + 1}/{len(chunks)} in {channel}", flush=True)
+    if dropped:
         try:
-            api("chat.postMessage", **kw)
-        except Exception as exc:
-            print(f"[slack] post failed in {channel}: {exc}", flush=True)
-            return
+            api("chat.postMessage", channel=channel,
+                text=f"⚠️ 这条回复有 {dropped}/{len(chunks)} 段没发出去(发送失败,详见容器日志)。")
+        except Exception:
+            pass
 
 
 def react(channel, ts, name):
@@ -201,13 +223,20 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
             "something you don't do, and move on."
         )
     lines.append(
-        "Use the recent messages for context; act on the new Message; reply "
-        "concisely in plain text. For longer work, post brief progress updates "
-        f"as you go (`python /app/src/slack_api.py post {channel} \"...\"`); the "
-        "bridge only posts your final answer. Do NOT put a status/done checkmark "
-        "(✅) in your reply text — the bridge already signals completion by "
-        "swapping the 👀 reaction on the user's message to ✅. Keep the prose free "
-        "of status emoji."
+        "Use the recent messages for context; act on the new Message. Your final "
+        "answer IS delivered to this channel in full — long answers are split into "
+        "several messages automatically, so put the COMPLETE deliverable in it: the "
+        "actual results, numbers, findings, and any decision you need from the "
+        "user. NEVER leave the substance only in local files or session memory — "
+        "the user cannot see your machine, so 'full log in tmp/x.txt' delivers "
+        "nothing; quote the relevant content itself. For longer work, post brief "
+        "progress updates as you go "
+        f"(`python /app/src/slack_api.py post {channel} \"...\"`) so nothing stays "
+        "invisible; for background jobs use subagent.py with --channel <this "
+        "channel> --report so results reach this channel even after this run "
+        "exits. Do NOT put a status/done checkmark (✅) in your reply text — the "
+        "bridge already signals completion by swapping the 👀 reaction on the "
+        "user's message to ✅. Keep the prose free of status emoji."
     )
     img_block = ""
     if images:

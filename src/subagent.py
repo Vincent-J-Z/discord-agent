@@ -109,7 +109,12 @@ def _write_runner(command, name, channel, report):
         f"echo ${{PIPESTATUS[0]}} > {shlex.quote(done)}",
     ]
     if report and channel:
-        api = shlex.quote(os.path.join(ROOT, "discord_api.py"))
+        # Platform-aware: Slack channel ids are C…/D…/G… (alnum), Discord ids are
+        # numeric snowflakes — report through the matching toolbox, else the post
+        # silently 404s and the job's result never reaches the user.
+        ch = str(channel)
+        tool = "discord_api.py" if ch.isdigit() else "slack_api.py"
+        api = shlex.quote(os.path.join(ROOT, tool))
         # Build the message into a shell variable with the dynamic parts captured
         # FIRST, then post "$MSG" as a single argv. This keeps backticks / quotes /
         # $(...) that may appear in the log tail INERT — they're never re-parsed by
