@@ -13,11 +13,15 @@ container restarts), so a fresh agent run can rediscover what's running and why.
 Usage:
   subagent.py spawn <name> <command...>   # start a detached tmux session
       [--cwd DIR] [--channel CH] [--note "what/why"] [--report]
-  subagent.py claude <name> "<prompt>"    # spawn a sub-agent that IS a claude -p
-      [--cwd DIR] [--channel CH] [--note ...] [--model M]
+  subagent.py claude <name> "<prompt>"    # spawn a claude sub-agent
+      [--cwd DIR] [--channel CH] [--note ...] [--model M] [--interactive]
+      # --interactive runs a live claude REPL in the tmux pane (a STEERABLE
+      # worker): later `send <name> "<msg>"` reads to it as a new user message
+      # (course-correct, add constraints, `send <name> "/exit"` to finish).
+      # Without it, the sub-agent is one-shot `claude -p` (fire-and-forget).
   subagent.py list                        # all sessions + status (running/done)
   subagent.py logs <name> [--lines N]     # last N lines of the session's output
-  subagent.py send <name> "<keys>"        # type into the session (control it)
+  subagent.py send <name> "<keys>"        # type into the session (steer it)
   subagent.py wait <name> [--timeout S]   # block until it exits (for short waits)
   subagent.py kill <name>                 # stop + clean up
   subagent.py reap                        # drop state for sessions that ended
@@ -97,17 +101,70 @@ def _save_state(name, **fields):
     os.replace(tmp, _state_path(name))
 
 
-def _write_runner(command, name, channel, report):
+def _session_path(name):
+    return os.path.join(STATE_DIR, name + ".session")
+
+
+# Auth/config env a claude worker needs but a persistent tmux server won't have.
+_FORWARD_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR",
+                "CLAUDE_BIN", "CLAUDE_MODEL", "AGENT_NAME", "DISCORD_BOT_TOKEN",
+                "SLACK_BOT_TOKEN", "DISCORD_AGENT_WORKSPACE")
+
+
+def _write_runenv(path):
+    _ensure_dirs()
+    src = dict(os.environ)
+    # Fallback: fill any missing auth vars from the workspace .env, so a worker
+    # authenticates even when the caller's env is incomplete (the tmux server's
+    # env, a sweep, etc.). os.environ still wins where present.
+    envfile = os.path.join(WORKSPACE, ".env")
+    if os.path.exists(envfile):
+        try:
+            from dotenv import dotenv_values
+            for k, v in dotenv_values(envfile).items():
+                if v is not None:
+                    src.setdefault(k, v)
+        except Exception:
+            pass
+    lines = [f"{k}={shlex.quote(src[k])}" for k in _FORWARD_ENV if src.get(k)]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _write_runner(command, name, channel, report, claude_json=False):
     """Write a runner script that records the command's exit code and optionally
-    posts a Discord line on finish. tmux runs `bash <script>` — putting the body
-    in a file avoids all the quoting pitfalls of passing it as a tmux argument."""
+    posts a result line to the channel on finish. tmux runs `bash <script>` —
+    keeping the body in a file avoids all the quoting pitfalls.
+    claude_json=True: the command is a headless `claude -p --output-format json`;
+    the runner captures its session_id (for later `steer`/resume) and reports the
+    parsed `result` text rather than a raw log tail."""
     log = _log_path(name)
     done = os.path.join(STATE_DIR, name + ".exit")
+    # tmux is a persistent daemon: a new session inherits the env the tmux SERVER
+    # first started with — which lacks CLAUDE_CODE_OAUTH_TOKEN, so the worker's
+    # `claude` would be "Not logged in". Materialize the auth env this process
+    # holds into a per-worker file and source it first (mode 600; workspace is
+    # already where all secrets live).
+    runenv = os.path.join(STATE_DIR, name + ".runenv")
+    _write_runenv(runenv)
     lines = [
         "#!/bin/bash",
-        f"({command}) 2>&1 | tee {shlex.quote(log)}",
-        f"echo ${{PIPESTATUS[0]}} > {shlex.quote(done)}",
+        f"set -a; [ -f {shlex.quote(runenv)} ] && . {shlex.quote(runenv)}; set +a",
+        f"({command}) > {shlex.quote(log)} 2>&1",
+        f"echo $? > {shlex.quote(done)}",
     ]
+    if claude_json:
+        sess = _session_path(name)
+        # Pull session_id (so a follow-up can --resume this worker) and the result.
+        lines.append(
+            f"python3 -c \"import json,sys;"
+            f"d=json.load(open({_pyq(log)}));"
+            f"open({_pyq(sess)},'w').write(d.get('session_id') or '');"
+            f"open({_pyq(log)}+'.result','w').write(d.get('result') or '')\" 2>/dev/null || true"
+        )
     if report and channel:
         # Platform-aware: Slack channel ids are C…/D…/G… (alnum), Discord ids are
         # numeric snowflakes — report through the matching toolbox, else the post
@@ -115,17 +172,19 @@ def _write_runner(command, name, channel, report):
         ch = str(channel)
         tool = "discord_api.py" if ch.isdigit() else "slack_api.py"
         api = shlex.quote(os.path.join(ROOT, tool))
-        # Build the message into a shell variable with the dynamic parts captured
-        # FIRST, then post "$MSG" as a single argv. This keeps backticks / quotes /
-        # $(...) that may appear in the log tail INERT — they're never re-parsed by
-        # the shell. (The old form interpolated `{name}` and $(tail ...) straight
-        # into a double-quoted argument, so a kebab-case name like `video-demo`
-        # was command-substituted away and a `"` in the tail broke the post.)
-        prefix = shlex.quote(f"🤖 sub-agent `{name}` finished (exit ")
+        prefix = shlex.quote(f"🤖 worker `{name}` finished (exit ")
+        if claude_json:
+            # Report the actual answer text; fall back to a log tail if empty.
+            body_src = (f"BODY=$(cut -c1-1600 {shlex.quote(log)}.result 2>/dev/null); "
+                        f"[ -z \"$BODY\" ] && BODY=$(tail -n 3 {shlex.quote(log)} 2>/dev/null "
+                        f"| tr '\\n\\r\\t' '   ' | cut -c1-300)")
+        else:
+            body_src = (f"BODY=$(tail -n 3 {shlex.quote(log)} 2>/dev/null "
+                        f"| tr '\\n\\r\\t' '   ' | cut -c1-300)")
         lines += [
             f"EXIT=$(cat {shlex.quote(done)} 2>/dev/null)",
-            f"TAIL=$(tail -n 3 {shlex.quote(log)} 2>/dev/null | tr '\\n\\r\\t' '   ' | cut -c1-300)",
-            f'MSG="$(printf \'%s%s). tail: %s\' {prefix} "$EXIT" "$TAIL")"',
+            body_src,
+            f'MSG="$(printf \'%s%s):\\n%s\' {prefix} "$EXIT" "$BODY")"',
             f'python {api} post {shlex.quote(str(channel))} "$MSG" >/dev/null 2>&1 || true',
         ]
     lines.append("sleep 2")  # keep the pane briefly so `logs` works right after exit
@@ -133,6 +192,11 @@ def _write_runner(command, name, channel, report):
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     return path
+
+
+def _pyq(s):
+    """Quote a path for embedding inside a python -c "..." string (shell-double-quoted)."""
+    return "'" + str(s).replace("'", "\\'") + "'"
 
 
 def cmd_spawn(a):
@@ -147,7 +211,8 @@ def cmd_spawn(a):
         os.remove(os.path.join(STATE_DIR, name + ".exit"))
     except OSError:
         pass
-    runner = _write_runner(command, name, a.channel, a.report)
+    runner = _write_runner(command, name, a.channel, a.report,
+                           claude_json=getattr(a, "_claude_json", False))
     cwd = a.cwd or ROOT
     r = _tmux("new-session", "-d", "-s", _sess(name), "-c", cwd, "bash", runner)
     if r.returncode != 0:
@@ -162,18 +227,61 @@ def cmd_spawn(a):
     return 0
 
 
-def cmd_claude(a):
-    """Spawn a sub-agent that is itself a headless claude -p run."""
+def _claude_cmd(prompt, model, resume=None):
     bin_ = os.environ.get("CLAUDE_BIN", "claude")
-    parts = [bin_, "-p", "--permission-mode",
+    parts = [bin_, "-p", "--output-format", "json", "--permission-mode",
              os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")]
-    if a.model:
-        parts += ["--model", a.model]
-    parts.append(a.prompt)
-    a.command = " ".join(shlex.quote(p) for p in parts)
+    if model:
+        parts += ["--model", model]
+    if resume:
+        parts += ["--resume", resume]
+    parts.append(prompt)
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def cmd_claude(a):
+    """Dispatch a headless claude WORKER (`claude -p`). It runs to completion in
+    tmux, captures its session_id, and (with --report) posts the result to the
+    channel. Give it a real brief. To course-correct after it finishes a round,
+    `steer <name> "<follow-up>"` resumes the SAME session with your new message."""
+    a.command = _claude_cmd(a.prompt, a.model)
+    a._claude_json = True
     rc = cmd_spawn(a)
     if rc == 0:
-        _save_state(a.name, kind="claude", prompt=a.prompt)
+        _save_state(a.name, kind="claude", prompt=a.prompt, model=a.model)
+    return rc
+
+
+def cmd_steer(a):
+    """Course-correct a claude worker: resume its stored session with a follow-up
+    message, so it continues with full memory of what it already did. Use this
+    (not `send`, which only reaches live TUI/shell jobs) to adjust a claude
+    worker between rounds."""
+    st = _load_state(a.name)
+    try:
+        sid = open(_session_path(a.name)).read().strip()
+    except Exception:
+        sid = ""
+    if not sid:
+        print(f"error: no stored session for '{a.name}' (has it finished a round "
+              f"yet? only claude workers can be steered)", file=sys.stderr)
+        return 1
+    if _alive(a.name):
+        print(f"error: '{a.name}' is still running — wait for the round to finish "
+              f"(`logs {a.name}`), then steer", file=sys.stderr)
+        return 1
+    channel = a.channel or st.get("channel")
+    report = a.report or st.get("report")
+    a.command = _claude_cmd(a.follow_up, a.model or st.get("model", ""), resume=sid)
+    a.channel, a.report, a.note, a.cwd = channel, report, st.get("note", ""), st.get("cwd")
+    a._claude_json = True
+    for p in (_state_path(a.name), os.path.join(STATE_DIR, a.name + ".exit")):
+        pass  # keep state; spawn resets the exit marker itself
+    rc = cmd_spawn(a)
+    if rc == 0:
+        _save_state(a.name, kind="claude", prompt=a.follow_up, model=a.model or st.get("model", ""),
+                    channel=channel, note=st.get("note", ""))
+        print(f"steered '{a.name}' (resumed session {sid[:8]}…)")
     return rc
 
 
@@ -218,8 +326,10 @@ def cmd_logs(a):
         print(out, end="")
         return 0
     if _alive(a.name):
-        r = _tmux("capture-pane", "-p", "-t", _sess(a.name))
-        print("\n".join(r.stdout.splitlines()[-a.lines:]))
+        # Include scrollback so interactive (REPL) workers show real history.
+        r = _tmux("capture-pane", "-p", "-S", f"-{max(a.lines, 200)}", "-t", _sess(a.name))
+        out = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        print("\n".join(out[-a.lines:]))
         return 0
     print(f"(no logs for '{a.name}')", file=sys.stderr)
     return 1
@@ -285,15 +395,23 @@ def main():
     sp.add_argument("--report", action="store_true")
     sp.set_defaults(func=cmd_spawn)
 
-    sc = sub.add_parser("claude", help="spawn a headless claude -p sub-agent")
+    sc = sub.add_parser("claude", help="dispatch a headless claude worker (claude -p)")
     sc.add_argument("name")
-    sc.add_argument("prompt")
+    sc.add_argument("prompt", help="the task brief for the worker")
     sc.add_argument("--cwd")
     sc.add_argument("--channel")
     sc.add_argument("--note", default="")
     sc.add_argument("--model", default="")
     sc.add_argument("--report", action="store_true")
     sc.set_defaults(func=cmd_claude)
+
+    stp = sub.add_parser("steer", help="course-correct a finished claude worker (resume its session)")
+    stp.add_argument("name")
+    stp.add_argument("follow_up", help="your follow-up / correction, as one quoted string")
+    stp.add_argument("--channel")
+    stp.add_argument("--model", default="")
+    stp.add_argument("--report", action="store_true")
+    stp.set_defaults(func=cmd_steer)
 
     sl = sub.add_parser("list", help="list tracked sub-agents + status")
     sl.set_defaults(func=cmd_list)

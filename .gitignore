@@ -28,3 +28,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# sub-agent runtime artifacts (may contain tokens)
+.runenv

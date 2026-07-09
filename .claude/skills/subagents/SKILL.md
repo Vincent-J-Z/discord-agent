@@ -1,15 +1,15 @@
 ---
 name: subagents
-description: Run work that outlives a single @-invocation by spawning long-lived sub-agents in tmux, then maintaining them across invocations. Use for jobs longer than the ~30-min per-mention cap, anything you should background ("started, will report when done"), fanning a task out to parallel workers, or driving an interactive process — and for checking on / collecting / reaping jobs a previous invocation started.
+description: Dispatch real work to long-lived tmux workers and supervise them across invocations — the channel agent is the dispatcher, workers do the labor. Use for ANY substantial task (builds, installs, pipelines, coding tasks, long remote jobs), for steering a running worker (send follow-up instructions), and for checking on / collecting / reaping jobs a previous invocation started.
 ---
 
 # Sub-agents (tmux-backed, persistent across @-invocations)
 
-Each @-mention is one `claude -p` with a ~30-min cap and no memory beyond what it
-reads back. To do work that's **longer than that**, runs in the **background**,
-**fans out**, or must be **driven over time**, spawn it as a **sub-agent**: a
-process inside a named **tmux** session that keeps running after this `claude -p`
-exits. A later invocation rediscovers it, reads its output, controls it, or
+**You are the dispatcher, not the laborer.** The per-message run understands the
+user, answers, dispatches, supervises, and reports — substantial work happens in
+WORKERS: processes inside named **tmux** sessions that keep running after this
+`claude -p` exits (each @ has a ~30-min cap and no memory beyond what it reads
+back). A later invocation rediscovers a worker, reads its output, steers it, or
 reaps it. State lives in `/workspace/subagents/<name>.json` (+ a logfile under
 `/workspace/logs/`), so it survives container restarts.
 
@@ -23,10 +23,21 @@ One CLI does all of it: **`/app/src/subagent.py`** (tmux is preinstalled).
 python /app/src/subagent.py spawn <name> "<shell command>" \
     [--cwd DIR] [--channel <id>] [--note "what/why"] [--report]
 
-# A sub-agent that is itself a headless claude -p (delegate a focused task):
-python /app/src/subagent.py claude <name> "<prompt for the sub-agent>" \
+# A claude WORKER (preferred for tasks): headless `claude -p` in tmux. It runs
+# to completion, captures its session_id, and --report posts the RESULT text to
+# the channel. Course-correct it afterward with `steer` (resume, below).
+python /app/src/subagent.py claude <name> "<task brief>" \
     [--cwd DIR] [--channel <id>] [--note ...] [--model <m>] [--report]
 ```
+
+Write the brief like a real handoff: goal, context (paths, prior findings),
+constraints, definition of done, and an explicit "post progress AND the FULL
+final result to channel <id> with (discord|slack)_api.py". A worker reporting
+its own progress is how the user sees movement while it runs.
+
+Interactive `claude` REPLs can't be workers in this deployment — they demand an
+interactive `/login` (headless auth via env token isn't honored in the TUI).
+Headless `claude -p` + `steer` is the supported pattern.
 
 - `<name>` is a kebab-case task id: `video-backfill`, `beta-backtest`.
 - `--channel <id>` records where to report; with **`--report`** a line is posted
@@ -39,7 +50,8 @@ python /app/src/subagent.py claude <name> "<prompt for the sub-agent>" \
 ```bash
 python /app/src/subagent.py list                  # all tracked jobs + running/done(exit N)
 python /app/src/subagent.py logs  <name> [--lines 40]   # recent output (full history on disk)
-python /app/src/subagent.py send  <name> "<text>" # type a line + Enter into the session (drive it)
+python /app/src/subagent.py steer <name> "<follow-up>"  # claude worker: resume its session with a correction
+python /app/src/subagent.py send  <name> "<text>" # shell/TUI job: type a line + Enter into the pane
 python /app/src/subagent.py wait  <name> [--timeout 60] # block briefly until it exits
 python /app/src/subagent.py kill  <name>          # stop it
 python /app/src/subagent.py reap                  # forget state for sessions that ended
@@ -47,9 +59,14 @@ python /app/src/subagent.py reap                  # forget state for sessions th
 
 ## Playbook
 
-- **Long job (> a few min):** spawn with `--channel <here> --report`, post
-  "started, will report when done", and END your turn — don't sit and block.
-  The job posts its own completion; a future @ can `logs`/`list` for detail.
+- **Any substantial task (≳2 min):** dispatch a worker with `--channel <here>
+  --report`, tell the user what you started and how they'll hear back, and END
+  your turn — don't sit and block, and don't do the labor inline.
+- **Steering:** user wants a tweak / the worker drifted → `logs <name>` to see
+  where it is, then for a claude worker `steer <name> "<adjustment>"` (resumes
+  its session with your follow-up as a new message; the worker must have finished
+  its current round — steer runs the next round). For a live shell/TUI job,
+  `send <name> "<keys>"` types into its pane. `kill`/`reap` when truly done.
 - **Resuming:** at the start of a run, if the user asks "is it done?" / "how's X
   going?", run `list` then `logs <name>` and report — that's your only memory of
   what a prior invocation launched.
