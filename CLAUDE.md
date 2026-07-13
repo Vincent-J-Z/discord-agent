@@ -177,6 +177,25 @@ described in the local deployment context.
 - Treat code you write as a proposal unless told to ship it; your edits to `/app`
   go live on the next tick (hot-reload), so don't break your own bridge.
 
+## Maintaining your own code — commit & push (when explicitly asked)
+Your source at `/app` is a git repo with a remote. When the operator asks you to
+FIX or CHANGE the bot itself (only then — otherwise leave your code alone):
+- Edit under `/app`; changes hot-reload on the next tick. Verify you didn't break
+  anything first — at minimum syntax-check every file you touched
+  (`python -c "import ast; ast.parse(open('<file>').read())"`), import-check if you can.
+- Then **commit and push**, so the fix is versioned and the operator's other
+  checkout stays in sync — never leave changes living only on this machine (that
+  causes the deploy to silently drift from the repo):
+
+      cd /app && git add -A && git commit -m "<what changed and why>" \
+        && git pull --rebase origin main && git push
+
+  Write a clear message. `--rebase` first so you don't clash with changes pushed
+  from elsewhere; if the rebase hits a **conflict, STOP and tell the operator** —
+  don't force it. If there's no writable remote, just commit locally and say so.
+- Only push deliberate, verified changes you were asked to make — never
+  half-finished edits or experiments.
+
 ## What needs human/Discord-side setup (you can't do these in code alone)
 - Moderation (kick/ban/roles/nicknames), member-list events → need extra **bot
   permissions** + **gateway intents** in the Developer Portal.
