@@ -50,6 +50,7 @@ LAST_SWEEP_FILE = os.path.join(WORKSPACE, ".last_sweep")
 ACTIVITY_FILE = os.path.join(WORKSPACE, ".activity")
 LIMITED_FILE = os.path.join(WORKSPACE, ".limited_until")
 DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred")
+SLACK_DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred_slack")
 REPORTS_DIR = os.path.join(WORKSPACE, ".worker_reports")
 
 
@@ -74,6 +75,22 @@ def _resume_due():
     """True when the rate limit has reset and there are queued requests to answer."""
     try:
         if not any(n.endswith(".json") for n in os.listdir(DEFERRED_DIR)):
+            return False
+    except FileNotFoundError:
+        return False
+    try:
+        with open(LIMITED_FILE) as f:
+            until = float(f.read().strip())
+    except Exception:
+        until = 0.0
+    return time.time() >= until
+
+
+def _slack_resume_due():
+    """Same check as _resume_due(), for the separate Slack deferred queue (the
+    usage/rate-limit gate itself is shared across platforms via LIMITED_FILE)."""
+    try:
+        if not any(n.endswith(".json") for n in os.listdir(SLACK_DEFERRED_DIR)):
             return False
     except FileNotFoundError:
         return False
@@ -165,6 +182,7 @@ def main():
         _mark_sweep()  # don't sweep the instant we boot; first sweep one interval later
     sweep = None
     resume = None
+    slack_resume = None
     report = None
     try:
         while bridge.poll() is None:
@@ -178,6 +196,10 @@ def main():
             if (resume is None or resume.poll() is not None) and _resume_due():
                 print("[runtime] rate limit cleared — draining deferred queue", flush=True)
                 resume = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_resume.py")])
+            # Same, for the separate Slack deferred queue.
+            if slack_on and (slack_resume is None or slack_resume.poll() is not None) and _slack_resume_due():
+                print("[runtime] rate limit cleared — draining slack deferred queue", flush=True)
+                slack_resume = subprocess.Popen([sys.executable, os.path.join(ROOT, "slack_resume.py")])
             # A finished worker left a report — wake the dispatcher to narrate it.
             if (report is None or report.poll() is not None) and _reports_due():
                 print("[runtime] worker report(s) pending — narrating", flush=True)

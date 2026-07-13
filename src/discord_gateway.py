@@ -38,8 +38,11 @@ GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
 STATUS = os.environ.get("BOT_STATUS", "online")
 ACTIVITY_NAME = os.environ.get("BOT_ACTIVITY", "for @mentions")
 ACTIVITY_TYPE = int(os.environ.get("BOT_ACTIVITY_TYPE", "3"))
-# GUILD_MESSAGES lets Discord push MESSAGE_CREATE. Non-privileged.
-INTENTS = int(os.environ.get("GATEWAY_INTENTS", str(1 << 9)))
+# GUILD_MESSAGES (1<<9) lets Discord push guild MESSAGE_CREATE; DIRECT_MESSAGES
+# (1<<12) does the same for DMs. Both are NON-privileged (no Developer-Portal
+# change needed), and DM content — like @mention content — arrives without the
+# privileged Message Content intent, which is all a DM-replying bot needs.
+INTENTS = int(os.environ.get("GATEWAY_INTENTS", str((1 << 9) | (1 << 12))))
 WORKERS = int(os.environ.get("GATEWAY_WORKERS", "4"))
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
 
@@ -88,12 +91,12 @@ def identify_payload():
     }
 
 
-def _handle(channel_id, d):
+def _handle(channel_id, d, is_dm=False):
     global _inflight
     with _inflight_lock:
         _inflight += 1
     try:
-        bridge.handle_message(channel_id, d)
+        bridge.handle_message(channel_id, d, is_dm)
     except Exception as exc:
         print(f"[gateway] handler error in {channel_id}: {exc}", flush=True)
     finally:
@@ -102,21 +105,26 @@ def _handle(channel_id, d):
 
 
 def on_message_create(d):
-    # Cheap pre-filter: only @-mentions of the bot, never our own messages.
+    # Cheap pre-filter: never our own messages.
     if (d.get("author") or {}).get("id") == bridge.BOT_ID:
         return
-    if not bridge.is_addressed(d.get("content", "") or ""):
+    # A DM carries no guild_id. Every DM is directed at the bot, so it needs no
+    # @-mention; a guild message still must explicitly address the bot.
+    is_dm = d.get("guild_id") is None
+    if not is_dm and not bridge.is_addressed(d.get("content", "") or ""):
         return
     channel_id = str(d.get("channel_id"))
     who = (d.get("author") or {}).get("username")
+    kind = "DM" if is_dm else "@mention"
     # A reload is pending and we're about to re-exec — don't start new work that
-    # we'd just have to kill. The REST poller picks it up after we come back
-    # (the message isn't claimed until a handler actually runs it).
+    # we'd just have to kill. The REST poller picks up guild messages after we
+    # come back; DMs only arrive via the gateway, so they'd be missed during the
+    # brief reload window — acceptable, the user can resend.
     if _reloading.is_set():
-        print(f"[gateway] @mention in {channel_id} from {who} — deferring (reload pending)", flush=True)
+        print(f"[gateway] {kind} in {channel_id} from {who} — deferring (reload pending)", flush=True)
         return
-    print(f"[gateway] @mention in {channel_id} from {who} — dispatching", flush=True)
-    POOL.submit(_handle, channel_id, d)
+    print(f"[gateway] {kind} in {channel_id} from {who} — dispatching", flush=True)
+    POOL.submit(_handle, channel_id, d, is_dm)
 
 
 async def heartbeat(ws, interval, get_seq):

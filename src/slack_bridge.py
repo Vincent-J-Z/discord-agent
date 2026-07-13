@@ -22,6 +22,7 @@ import concurrent.futures
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -43,6 +44,11 @@ API = "https://slack.com/api"
 WORKERS = int(os.environ.get("SLACK_WORKERS", "2"))
 HISTORY_LIMIT = int(os.environ.get("SLACK_HISTORY_LIMIT", "12"))
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
+# Rate-limit gate: a SEPARATE queue from Discord's DEFERRED_DIR (b.DEFERRED_DIR),
+# since drain_deferred() over there posts via the Discord API and would mis-handle
+# a Slack record. discord_agent_runtime watches this dir too and launches
+# slack_resume.py to drain it once b.is_limited() clears (shared usage gate).
+SLACK_DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred_slack")
 
 # Persons linked to a Discord owner id are owners here too (same human).
 OWNER_PERSONS = {p for p in (b.person_for("discord", oid) for oid in b.OWNER_IDS) if p}
@@ -254,6 +260,108 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
             + f"{crossctx}{context_block}New Message:\n{prompt}{img_block}")
 
 
+def _slack_defer_path(channel, ts):
+    return os.path.join(SLACK_DEFERRED_DIR, f"{channel}__{str(ts).replace('.', '_')}.json")
+
+
+def defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images):
+    """Queue a rate-limited Slack event to be answered once the limit resets."""
+    os.makedirs(SLACK_DEFERRED_DIR, exist_ok=True)
+    rec = {
+        "channel": channel,
+        "ts": ts,
+        "thread_ts": thread_ts,
+        "user": user,
+        "author": author,
+        "person": person,
+        "text": text,
+        "is_dm": is_dm,
+        "owner_dm": owner_dm,
+        "images": images or [],
+    }
+    dst = _slack_defer_path(channel, ts)
+    tmp = dst + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, dst)
+
+
+def list_deferred_slack():
+    try:
+        return sorted(
+            os.path.join(SLACK_DEFERRED_DIR, n)
+            for n in os.listdir(SLACK_DEFERRED_DIR)
+            if n.endswith(".json")
+        )
+    except FileNotFoundError:
+        return []
+
+
+def drain_deferred_slack():
+    """Mirror of b.drain_deferred() for Slack: one coherent catch-up per
+    channel/thread — read the backlog and respond to the current state instead
+    of replaying every stale message. Stops (leaving the rest queued) if we get
+    rate-limited again, same philosophy as the Discord drain."""
+    groups = {}
+    for path in list_deferred_slack():
+        try:
+            with open(path) as f:
+                rec = json.load(f)
+            rec["_path"] = path
+            groups.setdefault((rec.get("channel"), rec.get("thread_ts")), []).append(rec)
+        except Exception:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    for (channel, thread_ts), recs in groups.items():
+        if b.is_limited():
+            return  # still limited — leave the rest for next time
+        recs.sort(key=lambda r: float(r.get("ts") or 0))
+        latest = recs[-1]
+        author = latest.get("author") or "user"
+        person = latest.get("person")
+        is_dm = latest.get("is_dm")
+        owner_dm = latest.get("owner_dm")
+        images = latest.get("images") or []
+        text = latest.get("text") or ""
+        catchup_text = (
+            "[You were rate-limited and just came back online. The recent channel "
+            "activity is in your context — catch up on what happened while you were "
+            "out and respond to what currently needs you, one item at a time. Do "
+            "NOT reply to each old message separately.]\n\n" + text
+        )
+        try:
+            history = fetch_history(channel, latest.get("ts"))
+        except Exception:
+            history = ""
+        crossctx = b.crossctx_block(person, "slack", channel)
+        instruction = build_instruction(author, channel, catchup_text, history, crossctx,
+                                         is_dm, owner_dm, images)
+        key = f"slack:{channel}"
+        try:
+            with b.channel_lock(key):
+                reply = b.run_claude(author, key, catchup_text, guild_id="_slack",
+                                     is_dm=is_dm, owner_dm=owner_dm, instruction=instruction)
+        except b.RateLimited:
+            return  # hit it again mid-drain — leave this and later groups queued
+        except subprocess.TimeoutExpired:
+            reply = f"⏱️ 排队的任务超过 {b.TIMEOUT_SECONDS // 60} 分钟上限,被中断。"
+        except Exception as exc:
+            reply = f"⚠️ bridge error: {str(exc)[:300]}"
+        try:
+            post(channel, reply, thread_ts)
+            unreact(channel, latest.get("ts"), "warning")
+            set_status(channel, latest.get("ts"), done=True)
+            b.log_crossctx(person, "slack", channel, text, reply)
+        finally:
+            for r in recs:  # clear the whole group's queue (handled in one pass)
+                try:
+                    os.remove(r["_path"])
+                except OSError:
+                    pass
+
+
 def notify_owner_of_dm(from_uid, from_name, text):
     """A non-owner DM'd the bot — forward a heads-up to the operator(s), then
     stay silent to the sender (DMs remain owner-only)."""
@@ -279,15 +387,18 @@ def handle(ev, is_dm):
     owner_dm = is_dm and person in OWNER_PERSONS
     thread_ts = ev.get("thread_ts")  # reply in-thread only if asked in a thread
     react(channel, ts, "eyes")
-    if b.is_limited():
-        set_status(channel, ts, done=False)
-        post(channel, f"⏳ Claude 额度暂时用满,约 {b.fmt_utc(b.limited_until())} 恢复。", thread_ts)
-        return
+    # Download images before the limit check (not after) so a queued record still
+    # has them available for the drain to replay later.
     images = download_images(ev)
     if not text:
         text = ("The user sent image(s) with no text — look at the attached image(s) and respond."
                 if images else
                 "The user only mentioned you without extra text. Reply briefly and ask what they need.")
+    if b.is_limited():
+        defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
+        set_status(channel, ts, done=False)
+        post(channel, f"⏳ Claude 额度暂时用满,约 {b.fmt_utc(b.limited_until())} 恢复后我会自动回复你。", thread_ts)
+        return
     print(f"[slack] handling {ts} in {channel} from {author} ({len(images)} img)", flush=True)
     history = fetch_history(channel, ts)
     crossctx = b.crossctx_block(person, "slack", channel)
@@ -298,8 +409,9 @@ def handle(ev, is_dm):
             reply = b.run_claude(author, key, text, guild_id="_slack",
                                  is_dm=is_dm, owner_dm=owner_dm, instruction=instruction)
     except b.RateLimited as rl:
+        defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
         set_status(channel, ts, done=False)
-        post(channel, f"⏳ Claude 额度用满,约 {b.fmt_utc(rl.reset)} 恢复。", thread_ts)
+        post(channel, f"⏳ Claude 额度刚好用满,约 {b.fmt_utc(rl.reset_epoch)} 恢复后我会自动回复你。", thread_ts)
         return
     except Exception as exc:
         print(f"[slack] handler error in {channel}: {exc}", flush=True)
