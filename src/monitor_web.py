@@ -11,14 +11,76 @@ bot. Optional access gate: set MONITOR_TOKEN in the workspace .env, then open
 import glob
 import json
 import os
+import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import httpx
 
 import monitor as m  # reuse the TUI's collectors + name cache
 
 PORT = int(os.environ.get("MONITOR_PORT", "8899"))
 TOKEN = os.environ.get("MONITOR_TOKEN", "").strip()
 DONE_KEEP = int(os.environ.get("WORKER_DONE_RETENTION", str(24 * 3600)))
+SLACK_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+_SLACK_UID = re.compile(r"^[UW][A-Z0-9]{6,}$")
+
+
+def _slack_api(method, **params):
+    r = httpx.post(f"https://slack.com/api/{method}",
+                   headers={"Authorization": f"Bearer {SLACK_TOKEN}",
+                            "Content-Type": "application/json; charset=utf-8"},
+                   json=params, timeout=6)
+    d = r.json()
+    if not d.get("ok"):
+        raise RuntimeError(d.get("error"))
+    return d
+
+
+def slack_user(uid):
+    """Slack uid → display name, cached in the shared name cache."""
+    k = "su:" + uid
+    if k not in m._names:
+        try:
+            u = _slack_api("users.info", user=uid)["user"]
+            m._names[k] = (u.get("profile", {}).get("display_name")
+                           or u.get("real_name") or u.get("name") or uid)
+        except Exception:
+            return uid  # don't cache failures (scope may get fixed later)
+        m._save_names()
+    return m._names[k]
+
+
+def slack_channel(cid):
+    """Slack channel id → human label, cached."""
+    k = "sc:" + cid
+    if k not in m._names:
+        try:
+            c = _slack_api("conversations.info", channel=cid)["channel"]
+            if c.get("is_im"):
+                m._names[k] = "Slack DM · " + slack_user(c.get("user") or "")
+            else:
+                m._names[k] = "Slack · #" + (c.get("name") or cid)
+        except Exception:
+            return "Slack · " + cid[:9]
+        m._save_names()
+    return m._names[k]
+
+
+def _loc(channel, server=None):
+    ch = str(channel or "")
+    if ch.startswith("slack:"):
+        ch = ch[6:]
+    if ch and not ch.isdigit():  # Slack id (C…/D…/G…)
+        return slack_channel(ch)
+    cname, gid = m.channel_info(ch)
+    g = server or gid
+    return f"{m.guild_name(g)} · #{cname}" if g else f"#{cname}"
+
+
+def _who(name):
+    s = str(name or "")
+    return slack_user(s) if _SLACK_UID.match(s) else s
 
 
 def _heartbeat_series(cols=64, span=900, win=75):
@@ -59,13 +121,9 @@ def state():
                    for d in (".deferred", ".deferred_slack"))
     reports = len(glob.glob(os.path.join(m.WORKSPACE, ".worker_reports", "*.json")))
 
-    def loc(channel, server=None):
-        cname, gid = m.channel_info(channel)
-        return f"{m.guild_name(server or gid)} · #{cname}" if (server or gid) else f"#{cname}"
-
     agents = [{
-        "pid": d.get("pid"), "phase": d.get("phase"), "user": d.get("user"),
-        "where": loc(d.get("channel"), d.get("server")),
+        "pid": d.get("pid"), "phase": d.get("phase"), "user": _who(d.get("user")),
+        "where": _loc(d.get("channel"), d.get("server")),
         "elapsed": int(now - (d.get("start") or now)),
         "thinking": (d.get("thinking") or "")[-500:],
     } for d in runs]
@@ -79,14 +137,14 @@ def state():
         ch = s.get("channel")
         tasks.append({
             "name": s["name"], "status": s["status"], "running": s["running"],
-            "where": (loc(ch) if ch and str(ch).isdigit() else (str(ch) if ch else "—")),
+            "where": _loc(ch) if ch else "—",
             "age": int(now - (s.get("started") or now)),
             "note": s.get("note") or "",
         })
 
     recent = [{
-        "where": loc(r.get("channel")), "who": r.get("author"),
-        "cost": round(r.get("cost_usd") or 0, 4), "turns": r.get("turns"),
+        "where": _loc(r.get("channel")), "who": _who(r.get("author")),
+        "cost": round(r.get("cost_usd") or 0, 2), "turns": r.get("turns"),
         "dur": (r.get("duration_ms") or 0) // 1000,
         "ago": int(now - (r.get("ts") or now)),
     } for r in list(reversed(usage))[:10]]
@@ -113,16 +171,19 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 body{background:#151a24;color:#d6dbe5;font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;padding:14px}
 h1{font-size:15px;color:#7fd4c1;margin-bottom:10px;display:flex;justify-content:space-between;align-items:baseline}
 h1 small{color:#5a6273;font-weight:normal}
-.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
-.card{background:#1b2230;border:1px solid #2a3347;border-radius:8px;padding:10px 12px}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(max-width:820px){.grid{grid-template-columns:minmax(0,1fr)}.wide{grid-column:auto !important}}
+.wide{grid-column:1/-1}
+.card{background:#1b2230;border:1px solid #2a3347;border-radius:8px;padding:10px 12px;min-width:0}
 .card h2{font-size:12px;color:#8b93a7;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
 .kv{display:flex;flex-wrap:wrap;gap:6px 18px}
 .kv b{color:#fff;font-weight:600}
 .ok{color:#69d58c}.warn{color:#e8b34b}.bad{color:#ef6a6a}.dim{color:#5a6273}
-table{width:100%;border-collapse:collapse}
-td,th{padding:3px 6px;text-align:left;vertical-align:top}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+td,th{padding:3px 6px;text-align:left;vertical-align:top;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 th{color:#5a6273;font-weight:normal;font-size:12px}
 tr+tr td{border-top:1px solid #232c3e}
+td.wrap{white-space:normal}
 .right{text-align:right}
 .agent{border-left:3px solid #e8b34b;padding:6px 10px;margin:6px 0;background:#1f2735;border-radius:4px}
 .agent .meta{color:#7fa3d4;font-size:12px}
@@ -133,11 +194,11 @@ svg{display:block;width:100%;height:70px}
 </style></head><body>
 <h1>🍡 Mochi monitor <small id="clock"></small></h1>
 <div class="grid">
- <div class="card" style="grid-column:1/-1"><h2>overview</h2><div class="kv" id="ov"></div></div>
- <div class="card" style="grid-column:1/-1" id="agentsCard"><h2>active agents</h2><div id="agents"></div></div>
+ <div class="card wide"><h2>overview</h2><div class="kv" id="ov"></div></div>
+ <div class="card wide" id="agentsCard"><h2>active agents</h2><div id="agents"></div></div>
  <div class="card"><h2>tasks (workers)</h2><table id="tasks"></table></div>
  <div class="card"><h2>recent runs</h2><table id="recent"></table></div>
- <div class="card" style="grid-column:1/-1"><h2>token usage — last 15 min <span class="dim" id="hbsum"></span></h2>
+ <div class="card wide"><h2>token usage — last 15 min <span class="dim" id="hbsum"></span></h2>
    <svg id="hb" viewBox="0 0 640 70" preserveAspectRatio="none"></svg></div>
 </div>
 <div class="footer">read-only · refreshes every 3s · /api/state</div>
@@ -162,16 +223,18 @@ async function tick(){
    <div class="meta">${a.where} · ${a.user||''} · pid ${a.pid}</div>
    <div class="think">${(a.thinking||'…').replace(/</g,'&lt;')}</div></div></div>`).join('')
   :'<span class="dim">idle — no agents running</span>';
- document.getElementById('tasks').innerHTML='<tr><th></th><th>task</th><th>state</th><th class="right">age</th></tr>'+
+ document.getElementById('tasks').innerHTML='<colgroup><col style="width:16px"><col><col style="width:34%"><col style="width:52px"></colgroup>'+
+  '<tr><th></th><th>task</th><th>state</th><th class="right">age</th></tr>'+
   (s.tasks.length?s.tasks.map(t=>{
-   const c=t.running?'#69d58c':(t.status.includes('exit 0')?'#5a6273':'#ef6a6a');
+   const c=t.running?'#69d58c':(t.status.includes('exit 0')||t.status==='done'?'#5a6273':'#ef6a6a');
    return `<tr><td><span class="dot" style="background:${c}"></span></td>
-    <td><b>${t.name}</b><br><span class="dim">${t.note.slice(0,60)||''}</span></td>
-    <td>${t.status}<br><span class="dim">${t.where}</span></td>
+    <td class="wrap"><b>${t.name}</b><br><span class="dim">${t.note.slice(0,80)||''}</span></td>
+    <td class="wrap">${t.status}<br><span class="dim">${t.where}</span></td>
     <td class="right">${fmtAge(t.age)}</td></tr>`}).join('')
-   :'<tr><td class="dim">(none)</td></tr>');
- document.getElementById('recent').innerHTML='<tr><th>where</th><th>who</th><th class="right">$</th><th class="right">dur</th><th class="right">ago</th></tr>'+
-  s.recent.map(r=>`<tr><td>${r.where}</td><td>${r.who||''}</td><td class="right">${r.cost}</td>
+   :'<tr><td></td><td class="dim">(none)</td></tr>');
+ document.getElementById('recent').innerHTML='<colgroup><col style="width:44%"><col><col style="width:56px"><col style="width:52px"><col style="width:52px"></colgroup>'+
+  '<tr><th>where</th><th>who</th><th class="right">$</th><th class="right">dur</th><th class="right">ago</th></tr>'+
+  s.recent.map(r=>`<tr><td title="${r.where}">${r.where}</td><td title="${r.who||''}">${r.who||''}</td><td class="right">${r.cost}</td>
    <td class="right">${r.dur}s</td><td class="right">${fmtAge(r.ago)}</td></tr>`).join('');
  const v=s.heartbeat.series,mx=Math.max(...v,1),W=640,H=70,n=v.length;
  let pts=v.map((y,i)=>`${(i/(n-1)*W).toFixed(1)},${(H-2-(y/mx)*(H-6)).toFixed(1)}`).join(' ');
