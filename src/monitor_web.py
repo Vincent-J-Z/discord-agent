@@ -12,12 +12,19 @@ import glob
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 import httpx
 
 import monitor as m  # reuse the TUI's collectors + name cache
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+SUBAGENT = os.path.join(ROOT, "subagent.py")
+_NAME_OK = re.compile(r"^[\w.-]{1,64}$")  # worker names are kebab task ids
 
 PORT = int(os.environ.get("MONITOR_PORT", "8899"))
 TOKEN = os.environ.get("MONITOR_TOKEN", "").strip()
@@ -135,8 +142,10 @@ def state():
             if now - started > DONE_KEEP:
                 continue
         ch = s.get("channel")
+        sess = os.path.join(m.WORKSPACE, "subagents", s["name"] + ".session")
         tasks.append({
             "name": s["name"], "status": s["status"], "running": s["running"],
+            "steerable": (not s["running"]) and os.path.exists(sess),
             "where": _loc(ch) if ch else "—",
             "age": int(now - (s.get("started") or now)),
             "note": s.get("note") or "",
@@ -161,6 +170,29 @@ def state():
         "heartbeat": {"series": [round(v) for v in series], "tok15": int(tok15),
                       "cost15": round(cost15, 2)},
     }
+
+
+def _sub(*args, timeout=45):
+    r = subprocess.run([sys.executable, SUBAGENT, *args], cwd=ROOT, text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+    return r.returncode, r.stdout
+
+
+def do_action(name, action, body):
+    """Task actions from the dashboard. name is a validated worker id."""
+    if action == "logs":
+        code, out = _sub("logs", name, "--lines", "80")
+        return {"ok": code == 0, "output": out}
+    if action == "kill":
+        code, out = _sub("kill", name)
+        return {"ok": code == 0, "output": out}
+    if action == "steer":
+        text = (body.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "output": "empty follow-up"}
+        code, out = _sub("steer", name, text)  # resumes the worker's session
+        return {"ok": code == 0, "output": out}
+    return {"ok": False, "output": f"unknown action {action}"}
 
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -191,12 +223,20 @@ td.wrap{white-space:normal}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 svg{display:block;width:100%;height:70px}
 .footer{margin-top:10px;color:#3f4757;font-size:11px}
+.ops{margin-top:3px;display:flex;gap:4px}
+button{background:#26303f;color:#aeb6c6;border:1px solid #34405400;border-radius:4px;
+ font:11px ui-monospace,monospace;padding:2px 7px;cursor:pointer}
+button:hover{background:#31405a;color:#fff}
+button.bad:hover{background:#5a2a2a;color:#ffbcbc}
+#logout{display:none;white-space:pre-wrap;word-break:break-word;background:#0f141d;
+ border:1px solid #2a3347;border-radius:6px;padding:8px;margin-top:8px;font-size:12px;
+ max-height:260px;overflow:auto;color:#aeb6c6}
 </style></head><body>
 <h1>🍡 Mochi monitor <small id="clock"></small></h1>
 <div class="grid">
  <div class="card wide"><h2>overview</h2><div class="kv" id="ov"></div></div>
  <div class="card wide" id="agentsCard"><h2>active agents</h2><div id="agents"></div></div>
- <div class="card"><h2>tasks (workers)</h2><table id="tasks"></table></div>
+ <div class="card"><h2>tasks (workers)</h2><table id="tasks"></table><pre id="logout"></pre></div>
  <div class="card"><h2>recent runs</h2><table id="recent"></table></div>
  <div class="card wide"><h2>token usage — last 15 min <span class="dim" id="hbsum"></span></h2>
    <svg id="hb" viewBox="0 0 640 70" preserveAspectRatio="none"></svg></div>
@@ -223,12 +263,16 @@ async function tick(){
    <div class="meta">${a.where} · ${a.user||''} · pid ${a.pid}</div>
    <div class="think">${(a.thinking||'…').replace(/</g,'&lt;')}</div></div></div>`).join('')
   :'<span class="dim">idle — no agents running</span>';
- document.getElementById('tasks').innerHTML='<colgroup><col style="width:16px"><col><col style="width:34%"><col style="width:52px"></colgroup>'+
+ document.getElementById('tasks').innerHTML='<colgroup><col style="width:16px"><col><col style="width:30%"><col style="width:44px"></colgroup>'+
   '<tr><th></th><th>task</th><th>state</th><th class="right">age</th></tr>'+
   (s.tasks.length?s.tasks.map(t=>{
    const c=t.running?'#69d58c':(t.status.includes('exit 0')||t.status==='done'?'#5a6273':'#ef6a6a');
+   const nm=t.name.replace(/'/g,"\\'");
+   const ops=`<div class="ops"><button onclick="logs('${nm}')">log</button>`+
+    (t.steerable?`<button onclick="steer('${nm}')">steer</button>`:'')+
+    (t.running?`<button class="bad" onclick="kil('${nm}')">kill</button>`:'')+`</div>`;
    return `<tr><td><span class="dot" style="background:${c}"></span></td>
-    <td class="wrap"><b>${t.name}</b><br><span class="dim">${t.note.slice(0,80)||''}</span></td>
+    <td class="wrap"><b>${t.name}</b><br><span class="dim">${t.note.slice(0,80)||''}</span>${ops}</td>
     <td class="wrap">${t.status}<br><span class="dim">${t.where}</span></td>
     <td class="right">${fmtAge(t.age)}</td></tr>`}).join('')
    :'<tr><td></td><td class="dim">(none)</td></tr>');
@@ -243,45 +287,71 @@ async function tick(){
  document.getElementById('hbsum').textContent=` · Σ${s.heartbeat.tok15.toLocaleString()} tok · $${s.heartbeat.cost15} · peak ${Math.round(mx).toLocaleString()}/min`;
 }
 tick();setInterval(tick,3000);
+async function act(name,action,body){
+ try{const r=await fetch('/api/task/'+encodeURIComponent(name)+'/'+action,
+  {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  if(r.status===403){return{ok:false,output:'forbidden — open /?token=<MONITOR_TOKEN> once'}}
+  return await r.json()}catch(e){return{ok:false,output:String(e)}}}
+function showLog(n,txt){const e=document.getElementById('logout');e.style.display='block';
+ e.textContent='['+n+']\\n'+(txt||'(no output)');e.scrollTop=0}
+async function logs(n){showLog(n,'…');const d=await act(n,'logs');showLog(n,d.output)}
+async function steer(n){const t=prompt('steer '+n+' — follow-up / correction:');if(!t)return;
+ showLog(n,'steering…');const d=await act(n,'steer',{text:t});
+ showLog(n,(d.ok?'✓ steered (running next round)\\n':'✗ '+'\\n')+(d.output||''))}
+async function kil(n){if(!confirm('kill worker '+n+'?'))return;
+ const d=await act(n,'kill');showLog(n,d.output);tick()}
 </script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
     def _authed(self):
         if not TOKEN:
-            return True
+            return True  # no gate configured (read-only page); writes still blocked below
         if f"token={TOKEN}" in (self.path.split("?", 1) + [""])[1]:
             return True
         return f"mtok={TOKEN}" in (self.headers.get("Cookie") or "")
 
+    def _send(self, code, body=b"", ctype="text/plain"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if body:
+            self.wfile.write(body if isinstance(body, bytes) else body.encode())
+
     def do_GET(self):
         path = self.path.split("?")[0]
         if not self._authed():
-            self.send_response(403)
-            self.end_headers()
-            self.wfile.write(b"forbidden (set ?token=...)")
-            return
+            return self._send(403, "forbidden — open /?token=<MONITOR_TOKEN> once")
         if path == "/api/state":
             try:
-                body = json.dumps(state()).encode()
+                return self._send(200, json.dumps(state()), "application/json")
             except Exception as exc:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(str(exc).encode())
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-        elif path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(PAGE.encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+                return self._send(500, str(exc))
+        if path == "/":
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        self._send(404)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        # Writes ALWAYS require a configured token (never expose actions unauthed).
+        if not TOKEN or not self._authed():
+            return self._send(403, "forbidden — actions require MONITOR_TOKEN")
+        mtask = re.match(r"^/api/task/([^/]+)/(logs|kill|steer)$", path)
+        if not mtask:
+            return self._send(404)
+        name, action = unquote(mtask.group(1)), mtask.group(2)
+        if not _NAME_OK.match(name):
+            return self._send(400, "bad task name")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or "{}") if length else {}
+        except Exception:
+            body = {}
+        try:
+            return self._send(200, json.dumps(do_action(name, action, body)), "application/json")
+        except Exception as exc:
+            return self._send(200, json.dumps({"ok": False, "output": str(exc)}), "application/json")
 
     def log_message(self, *a):
         pass  # quiet
