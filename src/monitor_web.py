@@ -27,6 +27,7 @@ SUBAGENT = os.path.join(ROOT, "subagent.py")
 _NAME_OK = re.compile(r"^[\w.-]{1,64}$")  # worker names are kebab task ids
 
 PORT = int(os.environ.get("MONITOR_PORT", "8899"))
+WS_PORT = int(os.environ.get("MONITOR_WS_HOST_PORT", os.environ.get("MONITOR_WS_PORT", "8898")))
 TOKEN = os.environ.get("MONITOR_TOKEN", "").strip()
 DONE_KEEP = int(os.environ.get("WORKER_DONE_RETENTION", str(24 * 3600)))
 SLACK_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
@@ -232,7 +233,7 @@ button.bad:hover{background:#5a2a2a;color:#ffbcbc}
  border:1px solid #2a3347;border-radius:6px;padding:8px;margin-top:8px;font-size:12px;
  max-height:260px;overflow:auto;color:#aeb6c6}
 </style></head><body>
-<h1>🍡 Mochi monitor <small id="clock"></small></h1>
+<h1>🍡 Mochi monitor <small><a href="/terminal" style="color:#7fa3d4" target="_blank">⛶ terminal</a> · <span id="clock"></span></small></h1>
 <div class="grid">
  <div class="card wide"><h2>overview</h2><div class="kv" id="ov"></div></div>
  <div class="card wide" id="agentsCard"><h2>active agents</h2><div id="agents"></div></div>
@@ -303,6 +304,32 @@ async function kil(n){if(!confirm('kill worker '+n+'?'))return;
 </script></body></html>"""
 
 
+TERM_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Mochi terminal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+<style>html,body{margin:0;height:100%;background:#0f141d}#t{height:100vh;padding:4px}
+#s{position:fixed;top:6px;right:10px;color:#5a6273;font:12px ui-monospace,monospace;z-index:9}</style></head>
+<body><div id="s">connecting…</div><div id="t"></div>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+<script>
+const tok=(document.cookie.match(/mtok=([^;]+)/)||[])[1]||new URLSearchParams(location.search).get('token')||'';
+const term=new Terminal({fontFamily:'ui-monospace,Menlo,monospace',fontSize:13,cursorBlink:true,
+ theme:{background:'#0f141d',foreground:'#d6dbe5'}});
+const fit=new FitAddon.FitAddon();term.loadAddon(fit);term.open(document.getElementById('t'));fit.fit();
+const proto=location.protocol==='https:'?'wss':'ws';
+const ws=new WebSocket(proto+'://'+location.hostname+':__WS__/?token='+encodeURIComponent(tok));
+ws.binaryType='arraybuffer';
+const st=document.getElementById('s');
+function rs(){if(ws.readyState===1)ws.send(JSON.stringify({t:'resize',cols:term.cols,rows:term.rows}))}
+ws.onopen=()=>{st.textContent='connected';fit.fit();rs();term.focus()};
+ws.onmessage=e=>term.write(new Uint8Array(e.data));
+ws.onclose=()=>{st.textContent='disconnected';term.write('\\r\\n\\x1b[31m[disconnected]\\x1b[0m\\r\\n')};
+term.onData(d=>ws.readyState===1&&ws.send(d));
+addEventListener('resize',()=>{fit.fit();rs()});
+</script></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def _authed(self):
         if not TOKEN:
@@ -330,6 +357,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, str(exc))
         if path == "/":
             return self._send(200, PAGE, "text/html; charset=utf-8")
+        if path == "/terminal":
+            if not TOKEN:
+                return self._send(403, "terminal disabled — set MONITOR_TOKEN")
+            return self._send(200, TERM_PAGE.replace("__WS__", str(WS_PORT)), "text/html; charset=utf-8")
         self._send(404)
 
     def do_POST(self):

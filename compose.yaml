@@ -44,6 +44,7 @@ services:
     # disables the server entirely.
     ports:
       - "${MONITOR_HOST_PORT:-8899}:8899"
+      - "${MONITOR_WS_HOST_PORT:-8898}:8898"   # web terminal (PTY over WS)
     volumes:
       - ${DISCORD_AGENT_SOURCE_HOST:-.}:/app
       - ${DISCORD_AGENT_WORKSPACE_HOST:-${HOME}/discordAgentWorkspace}:/workspace
