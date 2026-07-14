@@ -1508,7 +1508,10 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=Fals
             "substantial work (builds, installs, pipelines, long jobs, real coding "
             "tasks) must be handed to a tmux worker via subagent.py claude/spawn "
             "(see CLAUDE.md), supervised with list/logs, and course-corrected with "
-            "`steer` — don't grind it inside this reply run.\n\n"
+            "`steer` — don't grind it inside this reply run. FIRST on every message "
+            "run `python /app/src/subagent.py list --channel <this channel>` to see "
+            "the tasks already going here and route any follow-up to the right one "
+            "(ask if it's ambiguous).\n\n"
             f"Sender: {author}\nThis channel: {channel_id}\n\n"
             f"{extra_context}{context_block}New Message:\n{prompt}"
         )

@@ -283,35 +283,72 @@ def cmd_steer(a):
     return rc
 
 
+DONE_RETENTION = int(os.environ.get("WORKER_DONE_RETENTION", str(24 * 3600)))  # 24h
+
+
+def _exit_code(name):
+    try:
+        return open(os.path.join(STATE_DIR, name + ".exit")).read().strip()
+    except Exception:
+        return None
+
+
+def _finished_at(name):
+    try:
+        return os.path.getmtime(os.path.join(STATE_DIR, name + ".exit"))
+    except OSError:
+        return None
+
+
 def _status(name):
     if _alive(name):
         return "running"
-    exit_marker = os.path.join(STATE_DIR, name + ".exit")
-    if os.path.exists(exit_marker):
-        try:
-            return "done(exit " + open(exit_marker).read().strip() + ")"
-        except Exception:
-            return "done"
-    return "ended"
+    code = _exit_code(name)
+    if code is None:
+        return "ended"
+    return "done" if code == "0" else f"failed(exit {code})"
+
+
+def _steerable(name, st):
+    """A claude worker that has finished a round and left a session can be
+    `steer`ed (resumed) with a follow-up."""
+    return (st.get("kind") == "claude" and not _alive(name)
+            and os.path.exists(_session_path(name)))
 
 
 def cmd_list(a):
+    """The task table. First thing to read on any message: what work is in this
+    conversation, its state, and whether it can be steered. Filter by --channel
+    to the current conversation; finished tasks drop off after DONE_RETENTION."""
     _ensure_dirs()
+    chan = getattr(a, "channel", None)
+    now = time.time()
     names = sorted(f[:-5] for f in os.listdir(STATE_DIR) if f.endswith(".json"))
-    if not names:
-        print("(no sub-agents tracked)")
-        return 0
+    rows = []
     for name in names:
         st = _load_state(name)
-        age = ""
-        if st.get("started_at"):
-            age = f"{int((time.time() - st['started_at']) // 60)}m ago"
-        line = f"{name:24} {_status(name):16} {age:10}"
-        if st.get("note"):
-            line += f"  — {st['note']}"
-        print(line)
-        if st.get("kind") == "claude" and st.get("prompt"):
-            print(f"{'':24} claude: {st['prompt'][:80]}")
+        if chan and str(st.get("channel") or "") != str(chan):
+            continue
+        running = _alive(name)
+        fin = _finished_at(name)
+        if not running and fin and (now - fin) > DONE_RETENTION:
+            continue  # finished long ago — off the table
+        if running:
+            base = st.get("started_at") or now
+            age = f"{int((now - base) // 60)}m"
+        elif fin:
+            age = f"{int((now - fin) // 60)}m ago"
+        else:
+            age = "?"
+        rows.append((name, _status(name), age,
+                     "steer" if _steerable(name, st) else "-",
+                     (st.get("note") or "").strip() or "(no description)"))
+    if not rows:
+        print("(no active tasks in this conversation)")
+        return 0
+    print(f"{'TASK':22} {'STATE':16} {'AGE':8} {'STEER':6} DESCRIPTION")
+    for name, state, age, steer, desc in rows:
+        print(f"{name:22} {state:16} {age:8} {steer:6} {desc[:80]}")
     return 0
 
 
@@ -411,7 +448,8 @@ def main():
     stp.add_argument("--report", action="store_true")
     stp.set_defaults(func=cmd_steer)
 
-    sl = sub.add_parser("list", help="list tracked sub-agents + status")
+    sl = sub.add_parser("list", help="the task table: workers + state (running/done/failed/steerable)")
+    sl.add_argument("--channel", help="only tasks for this conversation's channel id")
     sl.set_defaults(func=cmd_list)
 
     sg = sub.add_parser("logs", help="show recent output")
