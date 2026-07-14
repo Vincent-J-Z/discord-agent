@@ -178,6 +178,9 @@ def main():
     slack = subprocess.Popen([sys.executable, os.path.join(ROOT, "slack_bridge.py")]) if slack_on else None
     if slack_on:
         print("[runtime] slack bridge launched", flush=True)
+    # Web monitor (read-only dashboard). MONITOR_PORT=0 disables.
+    webmon_on = os.environ.get("MONITOR_PORT", "8899").strip() != "0"
+    webmon = subprocess.Popen([sys.executable, os.path.join(ROOT, "monitor_web.py")]) if webmon_on else None
     if SWEEP_INTERVAL > 0 and _last_sweep() == 0.0:
         _mark_sweep()  # don't sweep the instant we boot; first sweep one interval later
     sweep = None
@@ -192,6 +195,9 @@ def main():
             if slack_on and slack.poll() is not None:
                 print("[runtime] slack bridge exited; respawning", flush=True)
                 slack = subprocess.Popen([sys.executable, os.path.join(ROOT, "slack_bridge.py")])
+            if webmon_on and webmon.poll() is not None:
+                print("[runtime] web monitor exited; respawning", flush=True)
+                webmon = subprocess.Popen([sys.executable, os.path.join(ROOT, "monitor_web.py")])
             # Auto-resume: when the rate limit clears, answer the deferred queue.
             if (resume is None or resume.poll() is not None) and _resume_due():
                 print("[runtime] rate limit cleared — draining deferred queue", flush=True)
