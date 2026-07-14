@@ -37,10 +37,13 @@ services:
     # (e.g. to let the agent ssh to its own host machine).
     extra_hosts:
       - host.docker.internal:host-gateway
-    # Web monitor (read-only dashboard). Reachable at http://<host>:8899;
-    # set MONITOR_TOKEN in the workspace .env to gate access.
+    # Web monitor (read-only dashboard), container-internal port 8899. Publish it
+    # on MONITOR_HOST_PORT (compose also reads a .env next to this file, so put
+    # e.g. MONITOR_HOST_PORT=8890 there if 8899 is taken on the host). Set
+    # MONITOR_TOKEN in the workspace .env to gate access; MONITOR_PORT=0 there
+    # disables the server entirely.
     ports:
-      - "${MONITOR_PORT:-8899}:8899"
+      - "${MONITOR_HOST_PORT:-8899}:8899"
     volumes:
       - ${DISCORD_AGENT_SOURCE_HOST:-.}:/app
       - ${DISCORD_AGENT_WORKSPACE_HOST:-${HOME}/discordAgentWorkspace}:/workspace
