@@ -27,10 +27,10 @@ _SLACK_UID = re.compile(r"^[UW][A-Z0-9]{6,}$")
 
 
 def _slack_api(method, **params):
+    # Form-encoded, NOT json: Slack's read methods silently ignore JSON bodies.
     r = httpx.post(f"https://slack.com/api/{method}",
-                   headers={"Authorization": f"Bearer {SLACK_TOKEN}",
-                            "Content-Type": "application/json; charset=utf-8"},
-                   json=params, timeout=6)
+                   headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
+                   data=params, timeout=6)
     d = r.json()
     if not d.get("ok"):
         raise RuntimeError(d.get("error"))

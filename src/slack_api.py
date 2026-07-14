@@ -33,8 +33,9 @@ _user_cache = {}
 
 
 def _call(method, **params):
-    r = httpx.post(f"{API}/{method}", headers={**H, "Content-Type": "application/json; charset=utf-8"},
-                   json=params or {}, timeout=20)
+    # Form-encoded, NOT json: Slack's read methods silently ignore JSON bodies
+    # (users.info/conversations.info would act as if no args were passed).
+    r = httpx.post(f"{API}/{method}", headers=H, data=params or {}, timeout=20)
     d = r.json()
     if not d.get("ok"):
         raise SystemExit(f"{method} -> {d.get('error')}")

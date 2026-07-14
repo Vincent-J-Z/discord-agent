@@ -62,10 +62,12 @@ _seen = set()  # (channel, ts) — Socket Mode may redeliver
 
 
 def api(method, **params):
+    # Form-encoded, NOT json: Slack's read methods (users.info, conversations.*)
+    # silently ignore a JSON body — that's how user/channel names never resolved.
+    # Write methods accept form fine too (the classic Slack API encoding).
     r = httpx.post(f"{API}/{method}",
-                   headers={"Authorization": f"Bearer {BOT_TOKEN}",
-                            "Content-Type": "application/json; charset=utf-8"},
-                   json=params or {}, timeout=20)
+                   headers={"Authorization": f"Bearer {BOT_TOKEN}"},
+                   data=params or {}, timeout=20)
     d = r.json()
     if not d.get("ok"):
         raise RuntimeError(f"slack {method}: {d.get('error')}")
