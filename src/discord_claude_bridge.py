@@ -1226,8 +1226,11 @@ def fmt_utc(epoch):
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%H:%M UTC")
 
 
-def defer_message(channel_id, msg, prompt):
-    """Queue a request to be answered once the rate limit resets."""
+def defer_message(channel_id, msg, prompt, is_dm=False, owner_dm=False, person=None):
+    """Queue a request to be answered once the rate limit resets. Carries the
+    same is_dm/owner_dm/person context handle_message() would pass to run_claude
+    directly, so a replay from drain_deferred() doesn't downgrade an owner DM (or
+    any DM) to a plain server message and lose crossctx / privileged access."""
     os.makedirs(DEFERRED_DIR, exist_ok=True)
     author = msg.get("author") or {}
     rec = {
@@ -1238,6 +1241,9 @@ def defer_message(channel_id, msg, prompt):
         "is_bot": bool(author.get("bot")) and author.get("id") != BOT_ID,
         "guild_id": msg.get("guild_id") or CHANNEL_GUILD.get(str(channel_id)),
         "prompt": prompt,
+        "is_dm": bool(is_dm),
+        "owner_dm": bool(owner_dm),
+        "person": person,
     }
     dst = os.path.join(DEFERRED_DIR, f"{msg['id']}.json")
     tmp = dst + ".tmp"
@@ -1257,11 +1263,19 @@ def list_deferred():
         return []
 
 
-def drain_deferred():
+def drain_deferred(force=False):
     """After the limit resets, do ONE coherent catch-up per channel — read the
     backlog (via the context window) and respond to the current state, addressing
     open items one at a time — rather than replaying every stale message. Stops
-    (keeping the rest) if we get rate-limited again."""
+    (keeping the rest) if we get rate-limited again.
+
+    `force=True` is for an early "probe" retry: parse_reset_epoch()'s guessed
+    limited_until can land later than the real reset, so the caller may want to
+    try before that guess has passed. In that case skip the is_limited()
+    pre-check below and let run_claude's own RateLimited response be the real
+    gate — if the guess was wrong we drain right now; if it's genuinely still
+    limited, run_claude raises, we return exactly as in the normal path (no
+    post, queue left intact), so a wrong-but-early probe is silent either way."""
     groups = {}
     for path in list_deferred():
         try:
@@ -1275,7 +1289,7 @@ def drain_deferred():
             except OSError:
                 pass
     for ch, recs in groups.items():
-        if is_limited():
+        if not force and is_limited():
             return  # still limited — leave the rest for next time
         recs.sort(key=lambda r: int(r.get("message_id") or 0))
         latest = recs[-1]
@@ -1286,10 +1300,18 @@ def drain_deferred():
             "NOT reply to each old message separately, and do NOT @ other bots just "
             "to acknowledge.]\n\n" + (latest.get("prompt") or "")
         )
+        is_dm = bool(latest.get("is_dm"))
+        owner_dm = bool(latest.get("owner_dm"))
+        person = latest.get("person")
+        # Same crossctx injection handle_message() does for a live DM reply — a
+        # replay must not downgrade to a plain server message and lose the
+        # owner-DM privileged access or the cross-platform memory block.
+        extra = crossctx_block(person, "discord", ch) if (person and is_dm) else ""
         try:
             with channel_lock(ch):
                 reply = run_claude(latest.get("author") or "user", ch, catchup,
-                                   guild_id=latest.get("guild_id"))
+                                   guild_id=latest.get("guild_id"),
+                                   is_dm=is_dm, owner_dm=owner_dm, extra_context=extra)
         except RateLimited:
             return
         except subprocess.TimeoutExpired:
@@ -1719,7 +1741,7 @@ def handle_message(channel_id, msg, is_dm=False):
         )
     # Rate-limited right now → don't waste a call; queue it and answer on reset.
     if is_limited():
-        defer_message(channel_id, msg, prompt)
+        defer_message(channel_id, msg, prompt, is_dm=is_dm, owner_dm=owner_dm, person=person)
         react(channel_id, msg["id"], "⏳")
         # NEVER @ another bot with the limited notice — that pings it, it pings
         # back, and we're in an infinite "out of quota" ping-pong. Bots just get the
@@ -1755,7 +1777,7 @@ def handle_message(channel_id, msg, is_dm=False):
                 log_crossctx(person, "discord", channel_id, journal_ask, reply)
             except RateLimited as rl:
                 # Hit the limit mid-flight — queue it and tell the user it'll auto-resume.
-                defer_message(channel_id, msg, prompt)
+                defer_message(channel_id, msg, prompt, is_dm=is_dm, owner_dm=owner_dm, person=person)
                 react(channel_id, msg["id"], "⏳")
                 reply = f"⏳ Claude 额度刚好用满,约 {fmt_utc(rl.reset_epoch)} 恢复后我会自动回复你。"
             except subprocess.TimeoutExpired:

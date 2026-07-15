@@ -52,6 +52,13 @@ LIMITED_FILE = os.path.join(WORKSPACE, ".limited_until")
 DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred")
 SLACK_DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred_slack")
 REPORTS_DIR = os.path.join(WORKSPACE, ".worker_reports")
+# Early-probe cadence for the deferred queue (see _resume_probe_due()): the
+# reset time in LIMITED_FILE is often a guess (parse_reset_epoch() falls back
+# to now + LIMIT_DEFAULT_COOLDOWN when it can't parse Claude's own wording),
+# and a guess that lands later than the real reset would otherwise leave the
+# bot silently sitting on a cleared queue until the guess catches up.
+RESUME_PROBE_INTERVAL = int(os.environ.get("RESUME_PROBE_INTERVAL", "300"))
+RESUME_PROBE_FILE = os.path.join(WORKSPACE, ".resume_probe_at")
 
 
 def _not_limited():
@@ -84,6 +91,55 @@ def _resume_due():
     except Exception:
         until = 0.0
     return time.time() >= until
+
+
+def _last_probe():
+    try:
+        with open(RESUME_PROBE_FILE) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
+
+
+def _mark_probe():
+    with open(RESUME_PROBE_FILE, "w") as f:
+        f.write(str(time.time()))
+
+
+def _clear_probe():
+    try:
+        os.remove(RESUME_PROBE_FILE)
+    except OSError:
+        pass
+
+
+def _resume_probe_due():
+    """True when there's a queue waiting on a limited_until that HASN'T passed
+    yet, but it's been at least RESUME_PROBE_INTERVAL since the last early
+    retry. Lets discord_resume.py's `--probe` mode find out whether the
+    guessed reset (see RESUME_PROBE_INTERVAL comment above) was wrong, without
+    hammering Claude every TICK_SECONDS. Safe because the actual gate is the
+    RateLimited exception from run_claude, not this timer — a wrong probe is
+    silent (see discord_resume.py)."""
+    try:
+        if not any(n.endswith(".json") for n in os.listdir(DEFERRED_DIR)):
+            _clear_probe()  # no backlog — reset so the NEXT backlog starts its own cadence fresh
+            return False
+    except FileNotFoundError:
+        return False
+    try:
+        with open(LIMITED_FILE) as f:
+            until = float(f.read().strip())
+    except Exception:
+        until = 0.0
+    now = time.time()
+    if now >= until:
+        return False  # already past the guess — _resume_due() handles this normally
+    last = _last_probe()
+    if last == 0.0:
+        _mark_probe()  # first sighting of this backlog — start the cadence, don't probe instantly
+        return False
+    return (now - last) >= RESUME_PROBE_INTERVAL
 
 
 def _slack_resume_due():
@@ -206,9 +262,16 @@ def main():
                 print("[runtime] web terminal exited; respawning", flush=True)
                 webterm = subprocess.Popen([sys.executable, os.path.join(ROOT, "webterm.py")])
             # Auto-resume: when the rate limit clears, answer the deferred queue.
-            if (resume is None or resume.poll() is not None) and _resume_due():
-                print("[runtime] rate limit cleared — draining deferred queue", flush=True)
-                resume = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_resume.py")])
+            if resume is None or resume.poll() is not None:
+                if _resume_due():
+                    print("[runtime] rate limit cleared — draining deferred queue", flush=True)
+                    resume = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_resume.py")])
+                elif _resume_probe_due():
+                    # Guessed reset time hasn't passed yet, but it's been a while —
+                    # try anyway in case the guess is wrong. Silent if it isn't.
+                    _mark_probe()
+                    print("[runtime] probing deferred queue early (guessed reset may be wrong)", flush=True)
+                    resume = subprocess.Popen([sys.executable, os.path.join(ROOT, "discord_resume.py"), "--probe"])
             # Same, for the separate Slack deferred queue.
             if slack_on and (slack_resume is None or slack_resume.poll() is not None) and _slack_resume_due():
                 print("[runtime] rate limit cleared — draining slack deferred queue", flush=True)
