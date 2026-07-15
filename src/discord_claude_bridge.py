@@ -1354,6 +1354,16 @@ def ensure_server_dir(guild_id):
                 os.symlink(src, link)
         except OSError:
             pass
+    # Skills live at /app/.claude/skills; claude discovers them under the cwd's
+    # .claude/skills. cwd is THIS server dir, so symlink the repo skills in —
+    # otherwise the bot never actually loads them (it just has CLAUDE.md text).
+    skills_src = os.path.join(os.path.dirname(ROOT), ".claude", "skills")
+    skills_link = os.path.join(base, ".claude", "skills")
+    try:
+        if os.path.isdir(skills_src) and not os.path.lexists(skills_link):
+            os.symlink(skills_src, skills_link)
+    except OSError:
+        pass
     return base
 
 
