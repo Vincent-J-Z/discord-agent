@@ -20,10 +20,13 @@ ARG CLAUDE_CODE_VERSION=latest
 #   tmux              — long-lived sessions that outlive a single @-invocation;
 #                       used to spawn/maintain sub-agents (see subagent.py +
 #                       the `subagents` skill)
+#   calibre           — e-book manager; provides `ebook-convert` for headless
+#                       epub<->mobi/pdf/azw3 conversion
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         nodejs npm ca-certificates git curl jq unzip sudo openssh-client \
         ffmpeg postgresql-client libpq-dev build-essential tmux \
+        calibre \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
