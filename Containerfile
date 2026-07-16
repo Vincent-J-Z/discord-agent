@@ -3,7 +3,8 @@ FROM python:3.13-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    DISABLE_AUTOUPDATER=1
+    DISABLE_AUTOUPDATER=1 \
+    RCLONE_CONFIG=/workspace/.config/rclone/rclone.conf
 
 WORKDIR /app
 
@@ -35,6 +36,12 @@ RUN apt-get update \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
+
+# rclone — sync/copy to cloud storage (S3, Google Drive, Dropbox, …). Debian's
+# apt build lags badly, so pull the current static binary from the official
+# installer. Auth config is NOT baked in — it lives in a persistent, bind-mounted
+# dir (see RCLONE_CONFIG below) so credentials survive container rebuilds.
+RUN curl -fsSL https://rclone.org/install.sh | bash
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements.txt
