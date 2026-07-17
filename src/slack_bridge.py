@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 import httpx
@@ -55,6 +56,15 @@ SLACK_DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred_slack")
 # the other on/off switches in discord_claude_bridge.py.
 SLACK_LIVE_THINKING = os.environ.get("SLACK_LIVE_THINKING", "0").strip().lower() not in ("0", "", "false", "no")
 SLACK_THINKING_MIN_INTERVAL = 1.5  # seconds between pushes unless the phase changes
+
+# Thread-as-session routing + a cross-thread shared memory board. Default OFF:
+# with this off, every code path below that checks it is skipped and behavior
+# is byte-for-byte the flat shared-session behavior that predates this flag.
+# Same truthy convention as SLACK_LIVE_THINKING above.
+SLACK_THREAD_SESSIONS = os.environ.get("SLACK_THREAD_SESSIONS", "0").strip().lower() not in ("0", "", "false", "no")
+THREADMEM_DIR = os.path.join(WORKSPACE, "crossctx", "threadmem")
+THREADMEM_MAX_BYTES = 4096  # tail-truncation budget for the injected board
+_threadmem_lock = threading.Lock()
 
 # Persons linked to a Discord owner id are owners here too (same human).
 OWNER_PERSONS = {p for p in (b.person_for("discord", oid) for oid in b.OWNER_IDS) if p}
@@ -269,7 +279,120 @@ def fetch_history(channel, before_ts):
     return "\n".join(lines[-HISTORY_LIMIT:])
 
 
-def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_dm, images=None):
+def fetch_thread_history(channel, thread_ts, before_ts):
+    """Recent messages (oldest first) within ONE thread, for context — used in
+    place of fetch_history() when SLACK_THREAD_SESSIONS routes a message into
+    its own thread-session, so context stays scoped to that thread instead of
+    the whole channel. Same shape/limits as fetch_history()."""
+    try:
+        d = api("conversations.replies", channel=channel, ts=thread_ts, limit=HISTORY_LIMIT + 1)
+    except Exception as exc:
+        print(f"[slack] thread history fetch failed: {exc}", flush=True)
+        return ""
+    lines = []
+    for m in sorted(d.get("messages", []), key=lambda x: float(x.get("ts", 0))):
+        st = m.get("subtype")
+        if m.get("ts") == before_ts or (st and st != "file_share"):
+            continue
+        body = " ".join((m.get("text") or "").split())
+        if m.get("files"):
+            imgs = sum(1 for f in m["files"] if (f.get("mimetype") or "").startswith("image/"))
+            if imgs:
+                body = (body + f" [附{imgs}张图片]").strip()
+        if not body:
+            continue
+        lines.append(f"[{user_name(m.get('user') or m.get('bot_id'))}] {body[:500]}")
+    return "\n".join(lines[-HISTORY_LIMIT:])
+
+
+def _route_session(channel, ts, thread_ts, is_dm):
+    """SLACK_THREAD_SESSIONS routing (only called from behind that flag).
+
+    DM: always thread-ified — a top-level message roots a NEW thread/session
+    (session_thread = its own ts); replying inside an existing thread continues
+    that same session. Channel: an explicit thread_ts gets its own session;
+    top-level stays the shared flat session (session_thread=None), same as the
+    pre-flag behavior for that case.
+
+    Returns (session_thread, reply_thread_ts, key). reply_thread_ts is where
+    the reply is posted; key (also used as the channel_lock key) is the
+    "slack:{channel}" flat key when session_thread is falsy, else
+    "slack:{channel}:{session_thread}" so distinct threads run/serialize
+    independently of each other and of the flat channel session."""
+    if is_dm:
+        session_thread = thread_ts or ts
+    else:
+        session_thread = thread_ts or None
+    reply_thread_ts = session_thread
+    key = f"slack:{channel}:{session_thread}" if session_thread else f"slack:{channel}"
+    return session_thread, reply_thread_ts, key
+
+
+def _threadmem_path(channel):
+    return os.path.join(THREADMEM_DIR, f"{channel}.md")
+
+
+def _threadmem_read_block(channel):
+    """Tail-truncated shared memory board for this channel/DM, formatted for
+    injection into the instruction — visible to every thread-session in this
+    channel so knowledge doesn't get siloed inside one thread. Missing/empty
+    file -> "" (no injection, never an error)."""
+    try:
+        with open(_threadmem_path(channel), "rb") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    if len(data) > THREADMEM_MAX_BYTES:
+        data = data[-THREADMEM_MAX_BYTES:]
+    content = data.decode("utf-8", errors="ignore").strip()
+    if not content:
+        return ""
+    return ("=== 跨-thread 共享记忆板(本会话所有对话窗口的公共记忆,可引用) ===\n"
+            + content + "\n\n")
+
+
+_THREADMEM_LAST_RE = re.compile(r"\(last: [^)]*\)\s*$")
+
+
+def _threadmem_upsert(channel, session_thread, first_line):
+    """Mechanically record/refresh one directory line per thread-session — NO
+    model call. If this session_thread already has a line, only its `last`
+    timestamp is refreshed (the original snippet is kept, so repeated calls on
+    the same thread are idempotent — no duplicate lines). Otherwise a new line
+    is appended. This file doubles as a directory of what's being discussed
+    where. Best-effort: any failure is swallowed, never raised into handle()."""
+    try:
+        label = session_thread or "main"
+        now = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+        snippet = " ".join((first_line or "").split())[:60]
+        prefix = f"- [{label}] "
+        new_line = f"{prefix}{snippet} (last: {now})"
+        path = _threadmem_path(channel)
+        with _threadmem_lock:
+            os.makedirs(THREADMEM_DIR, exist_ok=True)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except FileNotFoundError:
+                lines = []
+            found = False
+            for i, ln in enumerate(lines):
+                if ln.startswith(prefix):
+                    lines[i] = _THREADMEM_LAST_RE.sub(f"(last: {now})", ln.rstrip())
+                    found = True
+                    break
+            if not found:
+                lines.append(new_line)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            os.replace(tmp, path)
+    except Exception as exc:
+        print(f"[slack] threadmem upsert failed: {exc}", flush=True)
+
+
+def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_dm, images=None,
+                       threadmem_content="", threadmem_path=None):
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
         if history else ""
@@ -323,6 +446,15 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
         "bridge already signals completion by swapping the 👀 reaction on the "
         "user's message to ✅. Keep the prose free of status emoji."
     )
+    if threadmem_path:
+        lines.append(
+            "This channel/DM has a cross-thread shared memory board — a plain "
+            "markdown file every thread-session here can read (injected above/below "
+            "as context when non-empty). If you learn something worth remembering "
+            f"across conversation windows (a durable fact, decision, or conclusion), "
+            f"you may append it yourself to {threadmem_path} so other threads can "
+            "pick it up too — not required every turn, only when it's worth keeping."
+        )
     img_block = ""
     if images:
         img_block = (
@@ -332,7 +464,7 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
         )
     return ("\n".join(lines)
             + f"\n\nSender: {author}\nThis Slack channel: {channel}\n\n"
-            + f"{crossctx}{context_block}New Message:\n{prompt}{img_block}")
+            + f"{threadmem_content}{crossctx}{context_block}New Message:\n{prompt}{img_block}")
 
 
 def _slack_defer_path(channel, ts):
@@ -376,24 +508,36 @@ def drain_deferred_slack():
     """Mirror of b.drain_deferred() for Slack: one coherent catch-up per
     channel/thread — read the backlog and respond to the current state instead
     of replaying every stale message. Stops (leaving the rest queued) if we get
-    rate-limited again, same philosophy as the Discord drain."""
+    rate-limited again, same philosophy as the Discord drain.
+
+    When SLACK_THREAD_SESSIONS is on, grouping/session-key/reply-target use the
+    SAME _route_session() rule handle() uses (recomputed from each record's
+    stored channel/ts/thread_ts/is_dm) instead of the flat (channel, thread_ts)
+    grouping — so this never replays into the wrong session. Off, the original
+    (channel, thread_ts) grouping and flat key are unchanged."""
     groups = {}
     for path in list_deferred_slack():
         try:
             with open(path) as f:
                 rec = json.load(f)
             rec["_path"] = path
-            groups.setdefault((rec.get("channel"), rec.get("thread_ts")), []).append(rec)
+            if SLACK_THREAD_SESSIONS:
+                _, _, gkey = _route_session(rec.get("channel"), rec.get("ts"),
+                                             rec.get("thread_ts"), rec.get("is_dm"))
+            else:
+                gkey = (rec.get("channel"), rec.get("thread_ts"))
+            groups.setdefault(gkey, []).append(rec)
         except Exception:
             try:
                 os.remove(path)
             except OSError:
                 pass
-    for (channel, thread_ts), recs in groups.items():
+    for recs in groups.values():
         if b.is_limited():
             return  # still limited — leave the rest for next time
         recs.sort(key=lambda r: float(r.get("ts") or 0))
         latest = recs[-1]
+        channel = latest.get("channel")
         author = latest.get("author") or "user"
         person = latest.get("person")
         is_dm = latest.get("is_dm")
@@ -406,14 +550,25 @@ def drain_deferred_slack():
             "out and respond to what currently needs you, one item at a time. Do "
             "NOT reply to each old message separately.]\n\n" + text
         )
+        if SLACK_THREAD_SESSIONS:
+            session_thread, reply_thread_ts, key = _route_session(
+                channel, latest.get("ts"), latest.get("thread_ts"), is_dm)
+        else:
+            session_thread, reply_thread_ts, key = None, latest.get("thread_ts"), f"slack:{channel}"
         try:
-            history = fetch_history(channel, latest.get("ts"))
+            if SLACK_THREAD_SESSIONS and session_thread:
+                history = fetch_thread_history(channel, session_thread, latest.get("ts"))
+            else:
+                history = fetch_history(channel, latest.get("ts"))
         except Exception:
             history = ""
         crossctx = b.crossctx_block(person, "slack", channel)
+        threadmem_content = _threadmem_read_block(channel) if SLACK_THREAD_SESSIONS else ""
+        threadmem_path = _threadmem_path(channel) if SLACK_THREAD_SESSIONS else None
         instruction = build_instruction(author, channel, catchup_text, history, crossctx,
-                                         is_dm, owner_dm, images)
-        key = f"slack:{channel}"
+                                         is_dm, owner_dm, images,
+                                         threadmem_content=threadmem_content,
+                                         threadmem_path=threadmem_path)
         try:
             with b.channel_lock(key):
                 reply = b.run_claude(author, key, catchup_text, guild_id="_slack",
@@ -425,10 +580,12 @@ def drain_deferred_slack():
         except Exception as exc:
             reply = f"⚠️ bridge error: {str(exc)[:300]}"
         try:
-            post(channel, reply, thread_ts)
+            post(channel, reply, reply_thread_ts)
             unreact(channel, latest.get("ts"), "warning")
             set_status(channel, latest.get("ts"), done=True)
             b.log_crossctx(person, "slack", channel, text, reply)
+            if SLACK_THREAD_SESSIONS:
+                _threadmem_upsert(channel, session_thread, text)
         finally:
             for r in recs:  # clear the whole group's queue (handled in one pass)
                 try:
@@ -468,11 +625,19 @@ def handle(ev, is_dm):
         text = ("The user sent image(s) with no text — look at the attached image(s) and respond."
                 if images else
                 "The user only mentioned you without extra text. Reply briefly and ask what they need.")
+    # SLACK_THREAD_SESSIONS routing: off keeps reply_thread_ts/key/thinking_ts
+    # exactly as before (thread_ts, flat "slack:{channel}", ts) — see
+    # _route_session()'s docstring for the on-behavior.
+    if SLACK_THREAD_SESSIONS:
+        session_thread, reply_thread_ts, key = _route_session(channel, ts, thread_ts, is_dm)
+    else:
+        session_thread, reply_thread_ts, key = None, thread_ts, f"slack:{channel}"
     if b.is_limited():
         defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
-        post(channel, f"⏳ Claude 额度暂时用满,约 {b.fmt_utc(b.limited_until())} 恢复后我会自动回复你。", thread_ts)
+        post(channel, f"⏳ Claude 额度暂时用满,约 {b.fmt_utc(b.limited_until())} 恢复后我会自动回复你。", reply_thread_ts)
         return
     print(f"[slack] handling {ts} in {channel} from {author} ({len(images)} img)", flush=True)
+    thinking_ts = (reply_thread_ts or ts) if SLACK_THREAD_SESSIONS else ts
     if SLACK_LIVE_THINKING:
         # Pin a single steady "received, working" line from the very first
         # moment. Pass a one-element `loading` so this immediately overrides any
@@ -480,14 +645,19 @@ def handle(ev, is_dm):
         # text-only status can't clear a sticky loading_messages — see
         # set_thinking()'s docstring). This kills the jarring flash of the old
         # three-line loop before the first real phase update arrives.
-        set_thinking(channel, ts, "💭 已收到,正在处理…", loading=["💭 已收到,正在处理…"])
+        set_thinking(channel, thinking_ts, "💭 已收到,正在处理…", loading=["💭 已收到,正在处理…"])
     else:
-        set_thinking(channel, ts, loading=["正在理解你的消息…", "翻查上下文…", "组织回复…"])
-    history = fetch_history(channel, ts)
+        set_thinking(channel, thinking_ts, loading=["正在理解你的消息…", "翻查上下文…", "组织回复…"])
+    if SLACK_THREAD_SESSIONS and session_thread:
+        history = fetch_thread_history(channel, session_thread, ts)
+    else:
+        history = fetch_history(channel, ts)
     crossctx = b.crossctx_block(person, "slack", channel)
-    instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm, images)
-    key = f"slack:{channel}"
-    progress_cb = _make_progress_cb(channel, ts) if SLACK_LIVE_THINKING else None
+    threadmem_content = _threadmem_read_block(channel) if SLACK_THREAD_SESSIONS else ""
+    threadmem_path = _threadmem_path(channel) if SLACK_THREAD_SESSIONS else None
+    instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm, images,
+                                     threadmem_content=threadmem_content, threadmem_path=threadmem_path)
+    progress_cb = _make_progress_cb(channel, thinking_ts) if SLACK_LIVE_THINKING else None
     try:
         with b.channel_lock(key):
             reply = b.run_claude(author, key, text, guild_id="_slack",
@@ -495,17 +665,19 @@ def handle(ev, is_dm):
                                  on_progress=progress_cb)
     except b.RateLimited as rl:
         defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
-        set_thinking(channel, ts, "")
-        post(channel, f"⏳ Claude 额度刚好用满,约 {b.fmt_utc(rl.reset_epoch)} 恢复后我会自动回复你。", thread_ts)
+        set_thinking(channel, thinking_ts, "")
+        post(channel, f"⏳ Claude 额度刚好用满,约 {b.fmt_utc(rl.reset_epoch)} 恢复后我会自动回复你。", reply_thread_ts)
         return
     except Exception as exc:
         print(f"[slack] handler error in {channel}: {exc}", flush=True)
-        set_thinking(channel, ts, "")
-        post(channel, f"⚠️ bridge error: {str(exc)[:300]}", thread_ts)
+        set_thinking(channel, thinking_ts, "")
+        post(channel, f"⚠️ bridge error: {str(exc)[:300]}", reply_thread_ts)
         return
-    set_thinking(channel, ts, "")  # clear before the reply lands (also auto-clears)
-    post(channel, reply, thread_ts)
+    set_thinking(channel, thinking_ts, "")  # clear before the reply lands (also auto-clears)
+    post(channel, reply, reply_thread_ts)
     b.log_crossctx(person, "slack", channel, text, reply)
+    if SLACK_THREAD_SESSIONS:
+        _threadmem_upsert(channel, session_thread, text)
 
 
 def on_event(ev):
