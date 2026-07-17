@@ -139,25 +139,11 @@ def post(channel, text, thread_ts=None):
             pass
 
 
-def react(channel, ts, name):
-    try:
-        api("reactions.add", channel=channel, timestamp=ts, name=name)
-    except Exception:
-        pass  # already_reacted etc. — cosmetic
-
-
-def unreact(channel, ts, name):
-    try:
-        api("reactions.remove", channel=channel, timestamp=ts, name=name)
-    except Exception:
-        pass  # no_reaction etc. — cosmetic
-
-
-def set_status(channel, ts, done, old="eyes"):
-    """Swap the trigger message's status reaction: 👀 while working →
-    ✅ done / ⚠️ error. Keeps the outcome on the message, out of the reply text."""
-    unreact(channel, ts, old)
-    react(channel, ts, "white_check_mark" if done else "warning")
+# NOTE: Slack does NOT use reaction-based status marks (unlike the Discord
+# bridge's 👀→✅ swap). Completion here is signalled by the reply itself plus
+# clearing the thinking text — see handle(). The old react/unreact/set_status
+# helpers were a Discord-ism whose only live effect was a stray ✅ appearing on
+# messages answered by the rate-limit drain; removed so resume matches normal.
 
 
 def set_thinking(channel, thread_ts, text="", loading=None):
@@ -442,9 +428,8 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
         "`python /app/src/subagent.py list --channel <this channel>` to see tasks "
         "already going here and route any follow-up to the right one (ask if "
         "ambiguous). Do NOT put a status/done "
-        "checkmark (✅) in your reply text — the "
-        "bridge already signals completion by swapping the 👀 reaction on the "
-        "user's message to ✅. Keep the prose free of status emoji."
+        "checkmark (✅) in your reply text — the reply itself is the completion "
+        "signal on Slack. Keep the prose free of status emoji."
     )
     if threadmem_path:
         lines.append(
@@ -581,8 +566,6 @@ def drain_deferred_slack():
             reply = f"⚠️ bridge error: {str(exc)[:300]}"
         try:
             post(channel, reply, reply_thread_ts)
-            unreact(channel, latest.get("ts"), "warning")
-            set_status(channel, latest.get("ts"), done=True)
             b.log_crossctx(person, "slack", channel, text, reply)
             if SLACK_THREAD_SESSIONS:
                 _threadmem_upsert(channel, session_thread, text)
