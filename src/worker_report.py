@@ -13,6 +13,8 @@ import glob
 import json
 import os
 import subprocess
+import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -25,6 +27,11 @@ load_dotenv(os.path.join(WORKSPACE, ".env"), override=True)
 load_dotenv(os.path.join(WORKSPACE, "secrets.env"), override=True)
 
 REPORTS_DIR = os.path.join(WORKSPACE, ".worker_reports")
+# Backstop thresholds: once narrate() (claude -p digesting the result) has
+# failed this many times, or the report has sat in the queue this long, give
+# up on narration and post the raw result directly instead (see backstop_post).
+REPORT_NARRATE_MAX_ATTEMPTS = int(os.environ.get("REPORT_NARRATE_MAX_ATTEMPTS", "3"))
+REPORT_BACKSTOP_AGE = int(os.environ.get("REPORT_BACKSTOP_AGE", "600"))
 
 
 def _instruction(rep):
@@ -92,10 +99,53 @@ def narrate(rep):
     return False
 
 
+def _backstop_due(rep):
+    """True once narrate() has failed too many times, or the report has aged
+    past the backstop window — either way further narrate attempts aren't
+    worth it and we fall back to a direct post (see backstop_post), which
+    works even while rate-limited since it never calls claude -p."""
+    if rep.get("attempts", 0) >= REPORT_NARRATE_MAX_ATTEMPTS:
+        return True
+    try:
+        ts = float(rep.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if ts <= 0.0:
+        return False
+    return (time.time() - ts) >= REPORT_BACKSTOP_AGE
+
+
+def backstop_post(rep):
+    """Last-resort delivery: post the worker's raw result straight to the
+    channel via the toolbox CLI, bypassing claude -p entirely. Used only when
+    narrate() has repeatedly failed or the report is too stale — the user
+    should get SOMETHING rather than a silently dropped result."""
+    channel = str(rep.get("channel"))
+    slack = not channel.isdigit()
+    script = os.path.join(ROOT, "slack_api.py" if slack else "discord_api.py")
+    result = (rep.get("result") or "(empty)").strip()
+    if len(result) > 1500:
+        result = result[:1500] + "…"
+    msg = (f"⚠️ worker {rep.get('name')} 已完成(exit {rep.get('exit')}),"
+           f"但我没能正常汇报,先把原始结果直发给你:\n{result}")
+    try:
+        r = subprocess.run([sys.executable, script, "post", channel, msg],
+                            cwd=ROOT, text=True, capture_output=True, timeout=60)
+    except Exception as exc:
+        print(f"[report] backstop post errored for '{rep.get('name')}': {exc}", flush=True)
+        return False
+    if r.returncode == 0:
+        print(f"[report] backstop-delivered worker '{rep.get('name')}' to {channel}", flush=True)
+        return True
+    print(f"[report] backstop post failed for '{rep.get('name')}': "
+          f"{(r.stderr or r.stdout)[:200]}", flush=True)
+    return False
+
+
 def main():
-    if b.is_limited():
-        print("[report] skipped — rate-limited", flush=True)
-        return
+    limited = b.is_limited()
+    if limited:
+        print("[report] rate-limited — only backstop-eligible reports will be delivered", flush=True)
     for path in sorted(glob.glob(os.path.join(REPORTS_DIR, "*.json"))):
         try:
             with open(path) as f:
@@ -103,19 +153,46 @@ def main():
         except Exception:
             os.remove(path)
             continue
-        if b.is_limited():
-            print("[report] rate-limited mid-run — leaving the rest queued", flush=True)
-            break
+
+        due_backstop = _backstop_due(rep)
+        # Rate limit may have started or cleared mid-run (a prior narrate() in
+        # this same pass can trip it) — re-check per report rather than once.
+        limited = b.is_limited()
+
+        if due_backstop:
+            if backstop_post(rep):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            else:
+                print(f"[report] backstop failed for '{rep.get('name')}' — will retry next tick", flush=True)
+            continue
+
+        if limited:
+            print(f"[report] rate-limited — leaving '{rep.get('name')}' queued", flush=True)
+            continue
+
         try:
-            narrate(rep)
+            ok = narrate(rep)
         except Exception as exc:
             print(f"[report] error narrating {path}: {exc}", flush=True)
-        # Remove regardless: a worker result is delivered once; on failure the
-        # log still holds it and the user can ask.
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+            ok = False
+
+        if ok:
+            # Delivered exactly once — narrate succeeded, no backstop needed.
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        else:
+            rep["attempts"] = rep.get("attempts", 0) + 1
+            rep["last_error"] = "narrate failed"
+            try:
+                with open(path, "w") as f:
+                    json.dump(rep, f, ensure_ascii=False)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

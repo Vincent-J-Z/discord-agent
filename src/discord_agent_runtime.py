@@ -59,6 +59,14 @@ REPORTS_DIR = os.path.join(WORKSPACE, ".worker_reports")
 # bot silently sitting on a cleared queue until the guess catches up.
 RESUME_PROBE_INTERVAL = int(os.environ.get("RESUME_PROBE_INTERVAL", "300"))
 RESUME_PROBE_FILE = os.path.join(WORKSPACE, ".resume_probe_at")
+# Same idea for the worker-report queue: while rate-limited, worker_report.py
+# can still deliver reports that have aged/failed into its backstop path (a
+# plain toolbox post, no claude -p involved) — so it must still be woken up.
+# But most pending reports during a rate limit AREN'T backstop-eligible yet,
+# so re-launching it every TICK_SECONDS would just be wasted process churn;
+# throttle those checks to once per RESUME_PROBE_INTERVAL, same as the probe
+# above. The moment the limit clears we check unconditionally.
+REPORT_PROBE_FILE = os.path.join(WORKSPACE, ".report_probe_at")
 
 
 def _not_limited():
@@ -69,13 +77,46 @@ def _not_limited():
         return True
 
 
+def _last_report_probe():
+    try:
+        with open(REPORT_PROBE_FILE) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
+
+
+def _mark_report_probe():
+    with open(REPORT_PROBE_FILE, "w") as f:
+        f.write(str(time.time()))
+
+
+def _clear_report_probe():
+    try:
+        os.remove(REPORT_PROBE_FILE)
+    except OSError:
+        pass
+
+
 def _reports_due():
-    """A finished worker left a report for the dispatcher to narrate."""
+    """A finished worker left a report for the dispatcher to narrate — or one
+    has aged/failed past worker_report.py's own backstop threshold and needs
+    its direct-post fallback, which works even while rate-limited. So pending
+    reports must wake worker_report.py regardless of the rate limit; only
+    throttle how OFTEN we do that while limited, so a stuck queue doesn't
+    respawn the process every tick (see REPORT_PROBE_FILE comment above)."""
     try:
         pending = any(n.endswith(".json") for n in os.listdir(REPORTS_DIR))
     except FileNotFoundError:
         return False
-    return pending and _not_limited()
+    if not pending:
+        _clear_report_probe()
+        return False
+    if _not_limited():
+        return True
+    if time.time() - _last_report_probe() < RESUME_PROBE_INTERVAL:
+        return False
+    _mark_report_probe()
+    return True
 
 
 def _resume_due():
