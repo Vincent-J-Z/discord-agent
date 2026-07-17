@@ -474,10 +474,13 @@ def handle(ev, is_dm):
         return
     print(f"[slack] handling {ts} in {channel} from {author} ({len(images)} img)", flush=True)
     if SLACK_LIVE_THINKING:
-        # No loading rotation primed here — real phase updates from
-        # _make_progress_cb take over immediately and would otherwise have to
-        # fight the fixed three-line rotation for the display.
-        set_thinking(channel, ts, "💭 接手中…")
+        # Pin a single steady "received, working" line from the very first
+        # moment. Pass a one-element `loading` so this immediately overrides any
+        # rotation lingering from a prior message on this thread (a plain
+        # text-only status can't clear a sticky loading_messages — see
+        # set_thinking()'s docstring). This kills the jarring flash of the old
+        # three-line loop before the first real phase update arrives.
+        set_thinking(channel, ts, "💭 已收到,正在处理…", loading=["💭 已收到,正在处理…"])
     else:
         set_thinking(channel, ts, loading=["正在理解你的消息…", "翻查上下文…", "组织回复…"])
     history = fetch_history(channel, ts)
