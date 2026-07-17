@@ -150,6 +150,11 @@ def set_thinking(channel, thread_ts, text="", loading=None):
     text clears it (sending a reply also clears it, 2-min timeout otherwise).
     Best-effort — needs the Agents feature enabled to actually render in the UI."""
     try:
+        # An empty status string CLEARS the indicator (per Slack docs), so when
+        # we mean "show thinking" the status must be non-empty even if loading
+        # messages are supplied — otherwise nothing renders at all.
+        if loading and not text:
+            text = loading[0]
         kw = {"channel_id": channel, "thread_ts": thread_ts, "status": text}
         if loading:
             kw["loading_messages"] = json.dumps(loading, ensure_ascii=False)
