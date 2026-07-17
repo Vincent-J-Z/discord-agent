@@ -6,9 +6,12 @@
 
 用法:
   python3 make_epub.py <图片目录> [-o 输出.epub] [-t 标题] [-a 作者]
-                       [--publisher 出版方] [--ltr]
+                       [--publisher 出版方] [--ltr] [--cover 封面图片]
 
-  <图片目录>   按文件名排序，第一张默认作为封面
+  <图片目录>   按文件名排序
+  --cover      指定封面图片路径（如漫画官方封面）；给了此参数时，
+               目录内全部图片都作为正文内页（不再丢第一张）。
+               不给时保持旧行为：第一张图当封面，其余为内页。
   --ltr        改为西式左往右翻页（默认 rtl，适合日漫）
 """
 import argparse, os, sys, uuid, zipfile, mimetypes
@@ -215,6 +218,7 @@ def main():
     ap.add_argument('--publisher', default='Kox.moe')
     ap.add_argument('--language', default='zh')
     ap.add_argument('--ltr', action='store_true', help='左往右翻页（默认右往左）')
+    ap.add_argument('--cover', help='封面图片路径（不给则用第一张内页凑数，向后兼容）')
     args = ap.parse_args()
 
     imgs = sorted(f for f in os.listdir(args.image_dir)
@@ -232,9 +236,14 @@ def main():
         'rtl': not args.ltr,
     }
 
-    # 第一张作封面，其余是内页
-    cover_src = os.path.join(args.image_dir, imgs[0])
-    body_imgs = imgs[1:] if len(imgs) > 1 else imgs
+    if args.cover:
+        # 独立封面图（如官方封面）：全部下载页都进正文，不丢第一页
+        cover_src = args.cover
+        body_imgs = imgs
+    else:
+        # 向后兼容：第一张作封面，其余是内页
+        cover_src = os.path.join(args.image_dir, imgs[0])
+        body_imgs = imgs[1:] if len(imgs) > 1 else imgs
 
     pages = []
     for idx, fn in enumerate(body_imgs, start=1):

@@ -21,6 +21,21 @@ WORK="$OUTROOT/_images/$BOOK"
 EPUBDIR="$OUTROOT/epub"
 mkdir -p "$WORK" "$EPUBDIR"
 
+# 官方封面图（g = 大图变体）：https://cf.hamreus.com/cpic/g/<comicId>.jpg
+COVER_FILE="$OUTROOT/cover_${COMIC_ID}.jpg"
+COVER_ARGS=()
+echo "== 获取官方封面 (comic $COMIC_ID) =="
+if curl -fsSL -A "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1" \
+     -e "https://m.manhuagui.com/" \
+     -o "$COVER_FILE" "https://cf.hamreus.com/cpic/g/${COMIC_ID}.jpg" \
+   && [ -s "$COVER_FILE" ]; then
+  echo "封面已下载: $COVER_FILE ($(wc -c < "$COVER_FILE") 字节)"
+  COVER_ARGS=(--cover "$COVER_FILE")
+else
+  echo "警告: 官方封面下载失败，回退为用第一张内页当封面（旧行为）"
+  rm -f "$COVER_FILE"
+fi
+
 echo "== 获取章节列表 (comic $COMIC_ID) =="
 CHAPTERS="$OUTROOT/chapters_${COMIC_ID}.tsv"
 node list_chapters.js "$COMIC_ID" > "$CHAPTERS"
@@ -47,7 +62,7 @@ for ((n=START; n<=END; n++)); do
 
   # 2) 打包 EPUB
   out="$EPUBDIR/${BOOK} - ${title}.epub"
-  python3 make_epub.py "$imgdir" -o "$out" -t "${BOOK} - ${title}" -a "$AUTHOR"
+  python3 make_epub.py "$imgdir" -o "$out" -t "${BOOK} - ${title}" -a "$AUTHOR" "${COVER_ARGS[@]}"
   ok=$((ok+1))
 
   # 3) 轻微限速，别把站点打爆
