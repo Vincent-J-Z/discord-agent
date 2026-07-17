@@ -144,6 +144,20 @@ def set_status(channel, ts, done, old="eyes"):
     react(channel, ts, "white_check_mark" if done else "warning")
 
 
+def set_thinking(channel, thread_ts, text="", loading=None):
+    """Slack Agents 'thinking' indicator via assistant.threads.setStatus. `text`
+    is a single status line; `loading` is a list Slack rotates through. Empty
+    text clears it (sending a reply also clears it, 2-min timeout otherwise).
+    Best-effort — needs the Agents feature enabled to actually render in the UI."""
+    try:
+        kw = {"channel_id": channel, "thread_ts": thread_ts, "status": text}
+        if loading:
+            kw["loading_messages"] = json.dumps(loading, ensure_ascii=False)
+        api("assistant.threads.setStatus", **kw)
+    except Exception as exc:
+        print(f"[slack] setStatus: {exc}", flush=True)
+
+
 def download_images(ev):
     """Download image attachments of a Slack message to the slack workdir and
     return their local absolute paths, so the agent can Read them (Claude is
@@ -405,6 +419,7 @@ def handle(ev, is_dm):
         post(channel, f"⏳ Claude 额度暂时用满,约 {b.fmt_utc(b.limited_until())} 恢复后我会自动回复你。", thread_ts)
         return
     print(f"[slack] handling {ts} in {channel} from {author} ({len(images)} img)", flush=True)
+    set_thinking(channel, ts, loading=["正在理解你的消息…", "翻查上下文…", "组织回复…"])
     history = fetch_history(channel, ts)
     crossctx = b.crossctx_block(person, "slack", channel)
     instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm, images)
@@ -415,14 +430,17 @@ def handle(ev, is_dm):
                                  is_dm=is_dm, owner_dm=owner_dm, instruction=instruction)
     except b.RateLimited as rl:
         defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
+        set_thinking(channel, ts, "")
         set_status(channel, ts, done=False)
         post(channel, f"⏳ Claude 额度刚好用满,约 {b.fmt_utc(rl.reset_epoch)} 恢复后我会自动回复你。", thread_ts)
         return
     except Exception as exc:
         print(f"[slack] handler error in {channel}: {exc}", flush=True)
+        set_thinking(channel, ts, "")
         set_status(channel, ts, done=False)
         post(channel, f"⚠️ bridge error: {str(exc)[:300]}", thread_ts)
         return
+    set_thinking(channel, ts, "")  # clear before the reply lands (also auto-clears)
     post(channel, reply, thread_ts)
     set_status(channel, ts, done=True)
     b.log_crossctx(person, "slack", channel, text, reply)
