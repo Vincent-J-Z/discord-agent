@@ -49,6 +49,12 @@ POOL = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
 # a Slack record. discord_agent_runtime watches this dir too and launches
 # slack_resume.py to drain it once b.is_limited() clears (shared usage gate).
 SLACK_DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred_slack")
+# Live thinking status: default OFF. When on, the setStatus indicator shown
+# while a message is being handled tracks the model's real phase/thinking
+# instead of the fixed three-line loading rotation. Same truthy convention as
+# the other on/off switches in discord_claude_bridge.py.
+SLACK_LIVE_THINKING = os.environ.get("SLACK_LIVE_THINKING", "0").strip().lower() not in ("0", "", "false", "no")
+SLACK_THINKING_MIN_INTERVAL = 1.5  # seconds between pushes unless the phase changes
 
 # Persons linked to a Discord owner id are owners here too (same human).
 OWNER_PERSONS = {p for p in (b.person_for("discord", oid) for oid in b.OWNER_IDS) if p}
@@ -161,6 +167,37 @@ def set_thinking(channel, thread_ts, text="", loading=None):
         api("assistant.threads.setStatus", **kw)
     except Exception as exc:
         print(f"[slack] setStatus: {exc}", flush=True)
+
+
+def _progress_text(phase, thinking):
+    """One status line for the live-thinking indicator: the emoji from `phase`
+    (💭/🔧/✍️) plus the last line of `thinking`, truncated. Falls back to the
+    bare phase when there's no thinking text yet."""
+    phase = (phase or "").strip()
+    emoji = phase.split(" ", 1)[0] if phase else ""
+    snippet = (thinking or "").strip()
+    if snippet:
+        snippet = snippet.splitlines()[-1].strip()
+    text = f"{emoji} {snippet}".strip() if snippet else phase
+    return text[:110]
+
+
+def _make_progress_cb(channel, ts):
+    """Build an on_progress(phase, thinking) callback for run_claude() that
+    pushes throttled live-status updates via set_thinking(). Pushes immediately
+    on a phase change, otherwise at most once per SLACK_THINKING_MIN_INTERVAL —
+    keeps this well under Slack's rate limits during a long tool-heavy run."""
+    state = {"last_push": 0.0, "last_phase": None}
+
+    def _cb(phase, thinking):
+        now = time.monotonic()
+        if phase == state["last_phase"] and now - state["last_push"] < SLACK_THINKING_MIN_INTERVAL:
+            return
+        state["last_push"] = now
+        state["last_phase"] = phase
+        set_thinking(channel, ts, _progress_text(phase, thinking))
+
+    return _cb
 
 
 def download_images(ev):
@@ -427,10 +464,12 @@ def handle(ev, is_dm):
     crossctx = b.crossctx_block(person, "slack", channel)
     instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm, images)
     key = f"slack:{channel}"
+    progress_cb = _make_progress_cb(channel, ts) if SLACK_LIVE_THINKING else None
     try:
         with b.channel_lock(key):
             reply = b.run_claude(author, key, text, guild_id="_slack",
-                                 is_dm=is_dm, owner_dm=owner_dm, instruction=instruction)
+                                 is_dm=is_dm, owner_dm=owner_dm, instruction=instruction,
+                                 on_progress=progress_cb)
     except b.RateLimited as rl:
         defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
         set_thinking(channel, ts, "")

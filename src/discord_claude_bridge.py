@@ -1407,11 +1407,15 @@ class _Res:
         self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
 
 
-def _stream_claude(cmd, cwd, env, run_id):
+def _stream_claude(cmd, cwd, env, run_id, on_progress=None):
     """Run claude with stream-json, writing live phase/thinking to the run's
     telemetry as events arrive. Returns a result whose stdout is the final
     `result` event (so the caller's json parsing is unchanged). Raises
-    subprocess.TimeoutExpired on timeout, like subprocess.run did."""
+    subprocess.TimeoutExpired on timeout, like subprocess.run did.
+
+    on_progress(phase, thinking), if given, is called at the same points as the
+    telemetry write below. Any exception it raises is swallowed — a broken
+    callback must never take down the underlying claude run."""
     proc = subprocess.Popen(
         cmd, cwd=cwd, env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1,
@@ -1471,6 +1475,11 @@ def _stream_claude(cmd, cwd, env, run_id):
             if phase and (phase == "done" or time.time() - last_write > 0.35):
                 write_run(run_id, phase=phase, thinking=think[-800:], updated=time.time())
                 last_write = time.time()
+                if on_progress is not None:
+                    try:
+                        on_progress(phase, think[-800:])
+                    except Exception:
+                        pass
         proc.wait()
     finally:
         timer.cancel()
@@ -1484,7 +1493,7 @@ def _stream_claude(cmd, cwd, env, run_id):
 
 
 def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=False,
-               owner_dm=False, extra_context="", instruction=None):
+               owner_dm=False, extra_context="", instruction=None, on_progress=None):
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
         if history
@@ -1582,7 +1591,7 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=Fals
             cmd.extend(["--resume", resume_id])
         cmd.append(instruction)
         if STREAM_TELEMETRY:
-            return _stream_claude(cmd, server_dir, sub_env, run_id)
+            return _stream_claude(cmd, server_dir, sub_env, run_id, on_progress=on_progress)
         return subprocess.run(
             cmd, cwd=server_dir, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, timeout=TIMEOUT_SECONDS, env=sub_env,
