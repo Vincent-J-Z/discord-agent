@@ -154,7 +154,15 @@ def set_thinking(channel, thread_ts, text="", loading=None):
     """Slack Agents 'thinking' indicator via assistant.threads.setStatus. `text`
     is a single status line; `loading` is a list Slack rotates through. Empty
     text clears it (sending a reply also clears it, 2-min timeout otherwise).
-    Best-effort — needs the Agents feature enabled to actually render in the UI."""
+    Best-effort — needs the Agents feature enabled to actually render in the UI.
+
+    IMPORTANT: `loading_messages` is sticky on Slack's side — once a call sets
+    it, later calls that omit the param do NOT clear it, so the rotation keeps
+    playing over a plain `status` update. Any caller that needs its `text` to
+    actually win over a previously-set rotation must pass `loading` too (a
+    single-element list pins the indicator to that one message, i.e. no visible
+    rotation, which is exactly a static status). Only omit `loading` when you
+    know no rotation was ever primed for this thread_ts."""
     try:
         # An empty status string CLEARS the indicator (per Slack docs), so when
         # we mean "show thinking" the status must be non-empty even if loading
@@ -195,7 +203,13 @@ def _make_progress_cb(channel, ts):
             return
         state["last_push"] = now
         state["last_phase"] = phase
-        set_thinking(channel, ts, _progress_text(phase, thinking))
+        text = _progress_text(phase, thinking)
+        # Pass a single-element `loading` too: the initial call in handle() may
+        # have primed a rotation (if SLACK_LIVE_THINKING was toggled mid-thread
+        # or a prior indicator lingered), and a plain `text`-only update would
+        # not clear it — see set_thinking()'s docstring. A one-item loading
+        # list pins the indicator to this exact text with no visible rotation.
+        set_thinking(channel, ts, text, loading=[text])
 
     return _cb
 
@@ -459,7 +473,13 @@ def handle(ev, is_dm):
         post(channel, f"⏳ Claude 额度暂时用满,约 {b.fmt_utc(b.limited_until())} 恢复后我会自动回复你。", thread_ts)
         return
     print(f"[slack] handling {ts} in {channel} from {author} ({len(images)} img)", flush=True)
-    set_thinking(channel, ts, loading=["正在理解你的消息…", "翻查上下文…", "组织回复…"])
+    if SLACK_LIVE_THINKING:
+        # No loading rotation primed here — real phase updates from
+        # _make_progress_cb take over immediately and would otherwise have to
+        # fight the fixed three-line rotation for the display.
+        set_thinking(channel, ts, "💭 接手中…")
+    else:
+        set_thinking(channel, ts, loading=["正在理解你的消息…", "翻查上下文…", "组织回复…"])
     history = fetch_history(channel, ts)
     crossctx = b.crossctx_block(person, "slack", channel)
     instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm, images)
