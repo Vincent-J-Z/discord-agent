@@ -405,7 +405,6 @@ def handle(ev, is_dm):
     author = user_name(user)
     owner_dm = is_dm and person in OWNER_PERSONS
     thread_ts = ev.get("thread_ts")  # reply in-thread only if asked in a thread
-    react(channel, ts, "eyes")
     # Download images before the limit check (not after) so a queued record still
     # has them available for the drain to replay later.
     images = download_images(ev)
@@ -415,7 +414,6 @@ def handle(ev, is_dm):
                 "The user only mentioned you without extra text. Reply briefly and ask what they need.")
     if b.is_limited():
         defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
-        set_status(channel, ts, done=False)
         post(channel, f"⏳ Claude 额度暂时用满,约 {b.fmt_utc(b.limited_until())} 恢复后我会自动回复你。", thread_ts)
         return
     print(f"[slack] handling {ts} in {channel} from {author} ({len(images)} img)", flush=True)
@@ -431,18 +429,15 @@ def handle(ev, is_dm):
     except b.RateLimited as rl:
         defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
         set_thinking(channel, ts, "")
-        set_status(channel, ts, done=False)
         post(channel, f"⏳ Claude 额度刚好用满,约 {b.fmt_utc(rl.reset_epoch)} 恢复后我会自动回复你。", thread_ts)
         return
     except Exception as exc:
         print(f"[slack] handler error in {channel}: {exc}", flush=True)
         set_thinking(channel, ts, "")
-        set_status(channel, ts, done=False)
         post(channel, f"⚠️ bridge error: {str(exc)[:300]}", thread_ts)
         return
     set_thinking(channel, ts, "")  # clear before the reply lands (also auto-clears)
     post(channel, reply, thread_ts)
-    set_status(channel, ts, done=True)
     b.log_crossctx(person, "slack", channel, text, reply)
 
 
