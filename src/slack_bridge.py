@@ -820,30 +820,147 @@ def drain_deferred_slack():
                     pass
 
 
-def notify_owner_of_dm(from_uid, from_name, text):
-    """A non-owner DM'd the bot — forward a heads-up to the operator(s), then
-    stay silent to the sender (DMs remain owner-only)."""
+# DM relay state: maps a heads-up message (owner_channel:heads_up_ts) to the
+# non-owner sender it's about, so an owner reply IN THAT THREAD can be routed
+# back out to the sender. Persisted to workspace so a restart doesn't strand a
+# pending approval. Small, capped, best-effort — never fatal.
+RELAY_PATH = os.path.join(WORKSPACE, ".dm_relay.json")
+_relay = {}
+_relay_lock = threading.Lock()
+
+
+def _relay_load():
+    global _relay
+    try:
+        with open(RELAY_PATH) as f:
+            _relay = json.load(f)
+    except Exception:
+        _relay = {}
+
+
+def _relay_save():
+    try:
+        tmp = RELAY_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_relay, f, ensure_ascii=False)
+        os.replace(tmp, RELAY_PATH)
+    except Exception as exc:
+        print(f"[slack] relay save failed: {exc}", flush=True)
+
+
+def _relay_remember(owner_channel, heads_up_ts, info):
+    with _relay_lock:
+        _relay[f"{owner_channel}:{heads_up_ts}"] = info
+        if len(_relay) > 200:  # keep the newest ~200 pending/answered relays
+            for k in list(_relay.keys())[:-200]:
+                _relay.pop(k, None)
+        _relay_save()
+
+
+def _relay_lookup(owner_channel, thread_ts):
+    return _relay.get(f"{owner_channel}:{thread_ts}")
+
+
+_relay_load()
+
+
+def notify_owner_of_dm(from_uid, from_name, text, from_channel, from_ts):
+    """A non-owner DM'd the bot — post a heads-up to the operator(s) and record
+    routing so the operator can authorize a reply by replying IN THE HEADS-UP
+    THREAD. Until they do, the bot stays silent to the sender (owner-gated)."""
     body = " ".join((text or "").split())[:500] or "(空消息)"
     for oid in OWNER_SLACK_IDS:
         if oid == from_uid:
             continue
         try:
-            ch = api("conversations.open", users=oid)["channel"]["id"]
-            post(ch, f"📩 *{from_name}* (`{from_uid}`) 私信了我(非 owner,我未回复):\n> {body}")
+            owner_ch = api("conversations.open", users=oid)["channel"]["id"]
+            r = api("chat.postMessage", channel=owner_ch,
+                    text=(f"📩 *{from_name}* (`{from_uid}`) 私信了我:\n> {body}\n\n"
+                          "↩️ 在这条消息的 *thread 里回复* 就会把你的答复发给 TA"
+                          "(直接给答案、或让我去做什么都行);不回复则我保持沉默。"))
+            heads_up_ts = r.get("ts")
+            if heads_up_ts:
+                _relay_remember(owner_ch, heads_up_ts, {
+                    "from_uid": from_uid, "from_name": from_name,
+                    "from_channel": from_channel, "from_ts": from_ts, "text": body,
+                })
         except Exception as exc:
             print(f"[slack] owner-notify failed: {exc}", flush=True)
+
+
+def _relay_instruction(from_name, original, directive):
+    return (
+        f"You are {b.AGENT_NAME}. A non-owner Slack user, {from_name}, DM'd you. Your "
+        f"operator (the bot's owner) has REVIEWED it and is now directing how you reply. "
+        f"Whatever you write below is delivered directly to {from_name} — they do NOT see "
+        f"the operator's directive or that the message was screened — so write it as a "
+        f"natural, self-contained message TO {from_name}.\n\n"
+        f"{from_name} wrote:\n{original}\n\n"
+        f"Operator's directive for your reply:\n{directive}\n\n"
+        "Treat the operator's directive as authoritative: if they gave you the actual "
+        "answer/content to convey, deliver it faithfully (you may phrase it naturally); if "
+        "they gave you an instruction or task, carry it out and reply with the result. Keep "
+        f"it concise and natural, in {from_name}'s language. Never mention the operator or "
+        "that this was screened/approved."
+    )
+
+
+def handle_owner_relay(ev, relay):
+    """Owner replied inside a DM-relay heads-up thread: run the agent under the
+    NON-OWNER's DM session with the owner's directive, deliver the result to
+    that sender (threaded off their original DM), and confirm back in-thread."""
+    owner_channel = ev["channel"]
+    owner_thread = ev.get("thread_ts")
+    directive = (ev.get("text") or "").strip()
+    if not directive:
+        return
+    from_uid = relay["from_uid"]
+    from_channel = relay["from_channel"]
+    from_ts = relay["from_ts"]
+    from_name = relay.get("from_name") or user_name(from_uid)
+    original = relay.get("text") or ""
+    key = f"slack:{from_channel}"
+    instruction = _relay_instruction(from_name, original, directive)
+    set_thinking(owner_channel, owner_thread, loading=[f"回复 {from_name} 中…"])
+    try:
+        with b.channel_lock(key):
+            reply = b.run_claude(from_name, key, directive, guild_id="_slack",
+                                 is_dm=True, owner_dm=False, instruction=instruction)
+    except b.RateLimited as rl:
+        set_thinking(owner_channel, owner_thread, "")
+        post(owner_channel, f"⏳ 额度用满,约 {b.fmt_utc(rl.reset_epoch)} 恢复后你再回复这条即可。", owner_thread)
+        return
+    except Exception as exc:
+        set_thinking(owner_channel, owner_thread, "")
+        print(f"[slack] relay error for {from_channel}: {exc}", flush=True)
+        post(owner_channel, f"⚠️ relay error: {str(exc)[:200]}", owner_thread)
+        return
+    set_thinking(owner_channel, owner_thread, "")
+    post(from_channel, reply, from_ts)  # deliver to the sender, in their DM thread
+    digest = " ".join((reply or "").split())[:300]
+    post(owner_channel, f"✅ 已回复 *{from_name}*:\n> {digest}", owner_thread)
+    try:
+        b.log_crossctx(b.person_for("slack", from_uid), "slack", from_channel,
+                       f"{original}  //[operator]: {directive}", reply)
+    except Exception:
+        pass
 
 
 def handle(ev, is_dm):
     channel, user, ts = ev["channel"], ev["user"], ev["ts"]
     person = b.person_for("slack", user)
+    thread_ts = ev.get("thread_ts")  # reply in-thread only if asked in a thread
     if is_dm and person not in OWNER_PERSONS:
-        notify_owner_of_dm(user, user_name(user), ev.get("text") or "")
-        return  # DMs are owner-only, same policy as Discord
+        notify_owner_of_dm(user, user_name(user), ev.get("text") or "", channel, ts)
+        return  # DMs stay owner-gated; owner authorizes any reply via the heads-up thread
+    # Owner replying INSIDE a DM-relay heads-up thread = authorize + steer the
+    # reply to that non-owner. Route it out to them; not a normal owner DM.
+    if is_dm and person in OWNER_PERSONS and thread_ts and _relay_lookup(channel, thread_ts):
+        handle_owner_relay(ev, _relay_lookup(channel, thread_ts))
+        return
     text = re.sub(rf"<@{SELF_ID}>", "", ev.get("text") or "").strip()
     author = user_name(user)
     owner_dm = is_dm and person in OWNER_PERSONS
-    thread_ts = ev.get("thread_ts")  # reply in-thread only if asked in a thread
     # Download images before the limit check (not after) so a queued record still
     # has them available for the drain to replay later.
     images = download_images(ev)
@@ -935,7 +1052,7 @@ def handle(ev, is_dm):
 def on_event(ev):
     et = ev.get("type")
     print(f"[slack] event: {et} ch={ev.get('channel')} user={ev.get('user')} "
-          f"subtype={ev.get('subtype')}", flush=True)
+          f"subtype={ev.get('subtype')} appctx={ev.get('app_context')}", flush=True)
     if et == "app_context_changed":
         # New Agent-experience context event (July 2026): replaces the
         # assistant_thread_* pair for apps with the Agent experience enabled.
