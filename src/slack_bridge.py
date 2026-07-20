@@ -17,8 +17,10 @@ and in the Slack app config: Socket Mode ON, Event Subscriptions with
 app_mention + message.im, scopes: app_mentions:read chat:write channels:history
 groups:history im:history im:read reactions:write users:read. The
 assistant_view panel features below (viewing-context, suggested prompts,
-auto-title) additionally want assistant_thread_started +
-assistant_thread_context_changed subscribed and the assistant:write scope —
+auto-title) additionally want app_context_changed (new
+Agent experience; also enriches message.im with an app_context field) or the
+legacy assistant_thread_started + assistant_thread_context_changed pair
+subscribed, plus the assistant:write scope —
 see the owner checklist wherever this bridge's operator tracks it.
 """
 import asyncio
@@ -241,12 +243,28 @@ def set_suggested_prompts(channel, thread_ts):
         print(f"[slack] setSuggestedPrompts: {exc}", flush=True)
 
 
+def _entities_channel(ctx):
+    """First channel-ish entity from an app_context payload ({"entities": [...]},
+    ordered by relevance; types look like "slack#/types/channel_id"). Returns
+    the channel/DM id or None — never raises on odd shapes."""
+    try:
+        for ent in (ctx or {}).get("entities") or []:
+            if str(ent.get("type") or "").endswith("channel_id") and ent.get("value"):
+                return ent["value"]
+    except Exception:
+        pass
+    return None
+
+
 def _lookup_viewing_channel(channel, thread_ts):
     """The channel the user currently has open in their main pane, as last
     reported for this assistant thread — or None if we never saw one (process
     just restarted, or the panel events aren't subscribed). Missing is a
-    normal, silent case: callers must degrade to no-context, never error."""
-    return _viewing_context.get(thread_ts) or _viewing_context.get(channel)
+    normal, silent case: callers must degrade to no-context, never error.
+    "latest" is the global slot fed by app_context_changed (the new
+    Agent-experience event, which isn't tied to a thread)."""
+    return (_viewing_context.get(thread_ts) or _viewing_context.get(channel)
+            or _viewing_context.get("latest"))
 
 
 def _maybe_set_thread_title(channel, thread_ts, text):
@@ -864,7 +882,12 @@ def handle(ev, is_dm):
     crossctx = b.crossctx_block(person, "slack", channel)
     threadmem_content = _threadmem_read_block(channel) if SLACK_THREAD_SESSIONS else ""
     threadmem_path = _threadmem_path(channel) if SLACK_THREAD_SESSIONS else None
-    viewing_channel = _lookup_viewing_channel(channel, thread_ts)
+    # Once app_context_changed is subscribed, Slack attaches the viewing
+    # context to the message event itself — most precise, so prefer it.
+    viewing_channel = (_entities_channel(ev.get("app_context"))
+                       or _lookup_viewing_channel(channel, thread_ts))
+    if viewing_channel == channel:
+        viewing_channel = None  # "viewing this very DM" adds nothing
     instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm, images,
                                      threadmem_content=threadmem_content, threadmem_path=threadmem_path,
                                      reply_thread_ts=reply_thread_ts, viewing_channel=viewing_channel)
@@ -913,6 +936,17 @@ def on_event(ev):
     et = ev.get("type")
     print(f"[slack] event: {et} ch={ev.get('channel')} user={ev.get('user')} "
           f"subtype={ev.get('subtype')}", flush=True)
+    if et == "app_context_changed":
+        # New Agent-experience context event (July 2026): replaces the
+        # assistant_thread_* pair for apps with the Agent experience enabled.
+        # No channel/user fields at the top level — just what's being viewed.
+        ch = _entities_channel(ev.get("context"))
+        if ch:
+            _viewing_context["latest"] = ch
+            print(f"[slack] viewing-context: user is viewing {ch}", flush=True)
+        else:
+            _viewing_context.pop("latest", None)
+        return
     if et in ("assistant_thread_started", "assistant_thread_context_changed"):
         # Different payload shape (no top-level channel/user/ts) — dispatch
         # before the generic app_mention/message filtering below, which
@@ -948,6 +982,15 @@ async def session():
             if m.get("envelope_id"):  # MUST ack fast or Slack redelivers
                 await ws.send(json.dumps({"envelope_id": m["envelope_id"]}))
             t = m.get("type")
+            # Surface anything unusual: envelope types we don't handle, and
+            # events_api events beyond the everyday message/app_mention flow —
+            # otherwise a whole feature's events can silently vanish here.
+            if t == "events_api":
+                _et = ((m.get("payload") or {}).get("event") or {}).get("type")
+                if _et not in ("message", "app_mention"):
+                    print(f"[slack] RAW events_api/{_et}: {raw[:600]}", flush=True)
+            elif t not in ("hello", "disconnect"):
+                print(f"[slack] RAW envelope {t}: {raw[:400]}", flush=True)
             if t == "hello":
                 print(f"[slack] READY — {b.AGENT_NAME} connected (Socket Mode)", flush=True)
             elif t == "disconnect":
