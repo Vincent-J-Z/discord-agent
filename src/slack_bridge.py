@@ -621,9 +621,11 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
         label = channel_name(viewing_channel)
         label = f"#{label}" if label else viewing_channel
         lines.append(
-            f"用户当前在 Slack 主界面里正看着频道 {label}(channel_id={viewing_channel})—— "
-            "这是 Slack 的 Assistant 面板上下文,仅供你判断他这句话可能指的是哪儿,不要"
-            "假设他一定是在问这个频道,该频道的具体消息内容你并没有(除非另有提供)。"
+            f"用户当前在 Slack 主界面里正看着频道 {label}(channel_id={viewing_channel}),"
+            "这是 Slack Assistant 面板给的上下文。当他的消息里出现『这个频道/这里/当前频道/"
+            "this channel』这类指代时,默认指的就是这个正在查看的频道——不是本 DM,也不是"
+            "别的频道。需要它的消息内容就用 slack_api.py read 去拉(channel_id 在上面);"
+            "只有当他明确点名别的地方时才另作解析。"
         )
     lines.append(
         "Use the recent messages for context; act on the new Message. Your final "
