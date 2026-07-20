@@ -7,11 +7,16 @@ discord_api.py). Used by the agent for anything Slack-side.
     python /app/src/slack_api.py post  <channel> "text" [--thread <ts>]
     python /app/src/slack_api.py dm    <uid|name> "text"     # private DM a person
     python /app/src/slack_api.py react <channel> <ts> <emoji_name>   # e.g. eyes
+    python /app/src/slack_api.py set-title <channel> <thread_ts> "title"
+    python /app/src/slack_api.py set-suggested-prompts <channel> <thread_ts> '[{"title":"..","message":".."}]'
 
 Channel ids look like C…/G… (channels) or D… (DMs). Threads are addressed by the
-parent message's ts via --thread.
+parent message's ts via --thread. set-title/set-suggested-prompts target an
+assistant_view panel thread_ts (not a regular reply thread) and need the
+assistant:write scope.
 """
 import argparse
+import json
 import os
 import sys
 
@@ -139,6 +144,21 @@ def react(a):
     print("ok")
 
 
+def set_title(a):
+    _call("assistant.threads.setTitle", channel_id=a.channel, thread_ts=a.thread_ts, title=a.title)
+    print("ok")
+
+
+def set_suggested_prompts(a):
+    prompts = json.loads(a.prompts)
+    kw = {"channel_id": a.channel, "thread_ts": a.thread_ts,
+          "prompts": json.dumps(prompts, ensure_ascii=False)}
+    if a.title:
+        kw["title"] = a.title
+    _call("assistant.threads.setSuggestedPrompts", **kw)
+    print("ok")
+
+
 def main():
     p = argparse.ArgumentParser(description="Slack agent toolbox")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -162,6 +182,18 @@ def main():
     re_.add_argument("ts")
     re_.add_argument("emoji")
     re_.set_defaults(fn=react)
+    st = sub.add_parser("set-title", help="assistant.threads.setTitle — needs assistant:write scope")
+    st.add_argument("channel")
+    st.add_argument("thread_ts")
+    st.add_argument("title")
+    st.set_defaults(fn=set_title)
+    sp = sub.add_parser("set-suggested-prompts",
+                         help="assistant.threads.setSuggestedPrompts — needs assistant:write scope")
+    sp.add_argument("channel")
+    sp.add_argument("thread_ts")
+    sp.add_argument("prompts", help='JSON array, e.g. \'[{"title":"...","message":"..."}]\' (max 4)')
+    sp.add_argument("--title", default="", help="optional panel title shown above the prompts")
+    sp.set_defaults(fn=set_suggested_prompts)
     a = p.parse_args()
     a.fn(a)
 

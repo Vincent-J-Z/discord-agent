@@ -12,9 +12,9 @@ container restarts), so a fresh agent run can rediscover what's running and why.
 
 Usage:
   subagent.py spawn <name> <command...>   # start a detached tmux session
-      [--cwd DIR] [--channel CH] [--note "what/why"] [--report]
+      [--cwd DIR] [--channel CH] [--thread TS] [--note "what/why"] [--report]
   subagent.py claude <name> "<prompt>"    # spawn a claude sub-agent
-      [--cwd DIR] [--channel CH] [--note ...] [--model M] [--interactive]
+      [--cwd DIR] [--channel CH] [--thread TS] [--note ...] [--model M] [--interactive]
       # --interactive runs a live claude REPL in the tmux pane (a STEERABLE
       # worker): later `send <name> "<msg>"` reads to it as a new user message
       # (course-correct, add constraints, `send <name> "/exit"` to finish).
@@ -30,6 +30,8 @@ Conventions:
 - Names are kebab-case task ids, e.g. `video-backfill`, `beta-backtest`.
 - `--channel` records where to report; with `--report` a wrapper posts a Discord
   line via /app/src/discord_api.py when the command finishes (exit code included).
+- `--thread` (Slack channel ids only) records the thread ts so the finished
+  report stays in that thread instead of posting top-level.
 - Long jobs: spawn, tell the user "started, will report when done", and check
   `list`/`logs` on a later invocation. Don't block this run waiting.
 """
@@ -134,14 +136,15 @@ def _write_runenv(path):
     os.replace(tmp, path)
 
 
-def _write_runner(command, name, channel, report, claude_json=False, note=""):
+def _write_runner(command, name, channel, report, claude_json=False, note="", thread=""):
     """Write a runner script that records the command's exit code and, when
     reporting, hands the result to the DISPATCHER (the channel agent) rather than
     posting to the channel itself: it drops a file in /workspace/.worker_reports/
     that the runtime picks up to wake the dispatcher, who narrates the outcome to
     the user in its own voice. tmux runs `bash <script>` (a file avoids quoting
     pitfalls). claude_json=True captures the worker's session_id (for `steer`)
-    and its parsed result text."""
+    and its parsed result text. thread (Slack only) is carried into the report
+    JSON so the dispatcher's reply lands back in the same thread."""
     log = _log_path(name)
     done = os.path.join(STATE_DIR, name + ".exit")
     # tmux is a persistent daemon: a new session inherits the env the tmux SERVER
@@ -180,6 +183,7 @@ def _write_runner(command, name, channel, report, claude_json=False, note=""):
             f"open({_pyq(log)}).read()[-2000:] if os.path.exists({_pyq(log)}) else '');"
             "json.dump({"
             f"'channel':{_pyq(str(channel))},'name':{_pyq(name)},'note':{_pyq(note or '')},"
+            f"'thread':{_pyq(thread or '')},"
             f"'exit':(open({_pyq(done)}).read().strip() if os.path.exists({_pyq(done)}) else '?'),"
             "'result':res,'ts':__import__('time').time()},"
             f"open({_pyq(pend)},'w'),ensure_ascii=False)\" 2>/dev/null || true",
@@ -210,7 +214,8 @@ def cmd_spawn(a):
         pass
     runner = _write_runner(command, name, a.channel, a.report,
                            claude_json=getattr(a, "_claude_json", False),
-                           note=getattr(a, "note", ""))
+                           note=getattr(a, "note", ""),
+                           thread=getattr(a, "thread", "") or "")
     cwd = a.cwd or ROOT
     r = _tmux("new-session", "-d", "-s", _sess(name), "-c", cwd, "bash", runner)
     if r.returncode != 0:
@@ -219,6 +224,7 @@ def cmd_spawn(a):
     _save_state(
         name, command=command, cwd=cwd, channel=a.channel, note=a.note,
         report=bool(a.report), started_at=int(time.time()), kind="shell",
+        thread=getattr(a, "thread", "") or "",
     )
     print(f"spawned sub-agent '{name}' in tmux session {_sess(name)}")
     print(f"  logs: subagent.py logs {name}    list: subagent.py list")
@@ -270,15 +276,16 @@ def cmd_steer(a):
         return 1
     channel = a.channel or st.get("channel")
     report = a.report or st.get("report")
+    thread = getattr(a, "thread", "") or st.get("thread") or ""
     a.command = _claude_cmd(a.follow_up, a.model or st.get("model", ""), resume=sid)
-    a.channel, a.report, a.note, a.cwd = channel, report, st.get("note", ""), st.get("cwd")
+    a.channel, a.report, a.note, a.cwd, a.thread = channel, report, st.get("note", ""), st.get("cwd"), thread
     a._claude_json = True
     for p in (_state_path(a.name), os.path.join(STATE_DIR, a.name + ".exit")):
         pass  # keep state; spawn resets the exit marker itself
     rc = cmd_spawn(a)
     if rc == 0:
         _save_state(a.name, kind="claude", prompt=a.follow_up, model=a.model or st.get("model", ""),
-                    channel=channel, note=st.get("note", ""))
+                    channel=channel, note=st.get("note", ""), thread=thread)
         print(f"steered '{a.name}' (resumed session {sid[:8]}…)")
     return rc
 
@@ -426,6 +433,7 @@ def main():
     sp.add_argument("command", help="the shell command, as ONE quoted string")
     sp.add_argument("--cwd")
     sp.add_argument("--channel")
+    sp.add_argument("--thread", default="", help="Slack thread ts to keep the report in (Slack only)")
     sp.add_argument("--note", default="")
     sp.add_argument("--report", action="store_true")
     sp.set_defaults(func=cmd_spawn)
@@ -435,6 +443,7 @@ def main():
     sc.add_argument("prompt", help="the task brief for the worker")
     sc.add_argument("--cwd")
     sc.add_argument("--channel")
+    sc.add_argument("--thread", default="", help="Slack thread ts to keep the report in (Slack only)")
     sc.add_argument("--note", default="")
     sc.add_argument("--model", default="")
     sc.add_argument("--report", action="store_true")
@@ -444,6 +453,7 @@ def main():
     stp.add_argument("name")
     stp.add_argument("follow_up", help="your follow-up / correction, as one quoted string")
     stp.add_argument("--channel")
+    stp.add_argument("--thread", default="", help="Slack thread ts (defaults to the stored one)")
     stp.add_argument("--model", default="")
     stp.add_argument("--report", action="store_true")
     stp.set_defaults(func=cmd_steer)

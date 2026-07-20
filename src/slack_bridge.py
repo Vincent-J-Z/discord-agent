@@ -15,7 +15,11 @@ workspace .env:
     SLACK_APP_TOKEN=xapp-…   (Socket Mode connection)
 and in the Slack app config: Socket Mode ON, Event Subscriptions with
 app_mention + message.im, scopes: app_mentions:read chat:write channels:history
-groups:history im:history im:read reactions:write users:read.
+groups:history im:history im:read reactions:write users:read. The
+assistant_view panel features below (viewing-context, suggested prompts,
+auto-title) additionally want assistant_thread_started +
+assistant_thread_context_changed subscribed and the assistant:write scope —
+see the owner checklist wherever this bridge's operator tracks it.
 """
 import asyncio
 import concurrent.futures
@@ -57,6 +61,14 @@ SLACK_DEFERRED_DIR = os.path.join(WORKSPACE, ".deferred_slack")
 SLACK_LIVE_THINKING = os.environ.get("SLACK_LIVE_THINKING", "0").strip().lower() not in ("0", "", "false", "no")
 SLACK_THINKING_MIN_INTERVAL = 1.5  # seconds between pushes unless the phase changes
 
+# Real streaming replies via Slack's chat.startStream/appendStream/stopStream
+# (see https://docs.slack.dev/changelog/2025/10/7/chat-streaming/). Default OFF:
+# with this off, handle() posts the full reply exactly as it does today — same
+# truthy convention as SLACK_LIVE_THINKING above.
+SLACK_STREAMING = os.environ.get("SLACK_STREAMING", "0").strip().lower() not in ("0", "", "false", "no")
+SLACK_STREAM_MIN_INTERVAL = 1.0  # seconds between appendStream flushes
+SLACK_STREAM_MIN_CHARS = 200  # or flush sooner once buffered text passes this
+
 # Thread-as-session routing + a cross-thread shared memory board. Default OFF:
 # with this off, every code path below that checks it is skipped and behavior
 # is byte-for-byte the flat shared-session behavior that predates this flag.
@@ -73,8 +85,32 @@ OWNER_SLACK_IDS = {uid for (plat, uid), name in b.USER_LINKS.items()
                    if plat == "slack" and name in OWNER_PERSONS}
 
 SELF_ID = None
+TEAM_ID = None  # this workspace's team id — chat.startStream wants recipient_team_id
 _user_cache = {}
+_channel_cache = {}
 _seen = set()  # (channel, ts) — Socket Mode may redeliver
+
+# assistant_view panel state — all process-local (in-memory), lost on restart.
+# That's an accepted degradation (see docstrings below), never an error.
+#
+# Viewing-context: which channel the user had open in their main pane when they
+# opened/switched the Assistant panel, from assistant_thread_started /
+# assistant_thread_context_changed. Keyed by thread_ts (falls back to the
+# assistant DM channel id for the rare event with no thread_ts yet).
+_viewing_context = {}
+# Thread keys (channel, thread_ts) already given an auto-title via
+# assistant.threads.setTitle — so we only set it once per conversation.
+_titled_threads = set()
+
+# Suggested prompts pinned to the top of a NEW assistant panel via
+# assistant.threads.setSuggestedPrompts (max 4, each {"title", "message"}).
+# Plain constant so these are easy to retune without touching the call site.
+SUGGESTED_PROMPTS = [
+    {"title": "频道摘要", "message": "这个频道最近在聊什么?帮我梳理一下"},
+    {"title": "查任务状态", "message": "现在有哪些在跑的任务?给我汇总一下进度"},
+    {"title": "帮我查一个东西", "message": "帮我查一下:"},
+    {"title": "你能做什么", "message": "你能帮我做哪些事?举几个例子"},
+]
 
 
 def api(method, **params):
@@ -101,6 +137,20 @@ def user_name(uid):
         except Exception:
             _user_cache[uid] = uid
     return _user_cache[uid]
+
+
+def channel_name(cid):
+    """Best-effort #name for a channel id, cached. Returns None (never raises)
+    if the lookup fails — callers must fall back to the raw id."""
+    if not cid:
+        return None
+    if cid not in _channel_cache:
+        try:
+            c = api("conversations.info", channel=cid)["channel"]
+            _channel_cache[cid] = c.get("name") or c.get("user")  # DMs have no "name", just a user
+        except Exception:
+            _channel_cache[cid] = None
+    return _channel_cache[cid]
 
 
 def post(channel, text, thread_ts=None):
@@ -173,6 +223,64 @@ def set_thinking(channel, thread_ts, text="", loading=None):
         print(f"[slack] setStatus: {exc}", flush=True)
 
 
+def set_suggested_prompts(channel, thread_ts):
+    """Pin SUGGESTED_PROMPTS to the top of a freshly-opened Assistant panel via
+    assistant.threads.setSuggestedPrompts. Called once per assistant_thread_started
+    event. Best-effort — needs the Agents & Assistants feature (assistant:write
+    scope) actually enabled, same caveat as set_thinking()."""
+    try:
+        api("assistant.threads.setSuggestedPrompts", channel_id=channel, thread_ts=thread_ts,
+            prompts=json.dumps(SUGGESTED_PROMPTS, ensure_ascii=False))
+    except Exception as exc:
+        print(f"[slack] setSuggestedPrompts: {exc}", flush=True)
+
+
+def _lookup_viewing_channel(channel, thread_ts):
+    """The channel the user currently has open in their main pane, as last
+    reported for this assistant thread — or None if we never saw one (process
+    just restarted, or the panel events aren't subscribed). Missing is a
+    normal, silent case: callers must degrade to no-context, never error."""
+    return _viewing_context.get(thread_ts) or _viewing_context.get(channel)
+
+
+def _maybe_set_thread_title(channel, thread_ts, text):
+    """Auto-title a NEW assistant thread from the user's first message (first
+    ~40 chars, no extra model call). No-ops on every later message in the same
+    thread — _titled_threads tracks what's already been set, process-local so
+    a restart just means the title gets (harmlessly) re-set once more."""
+    if not thread_ts:
+        return
+    key = (channel, thread_ts)
+    if key in _titled_threads:
+        return
+    _titled_threads.add(key)
+    title = " ".join((text or "").split())[:40].strip()
+    if not title:
+        return
+    try:
+        api("assistant.threads.setTitle", channel_id=channel, thread_ts=thread_ts, title=title)
+    except Exception as exc:
+        print(f"[slack] setTitle: {exc}", flush=True)
+
+
+def on_assistant_thread_event(ev):
+    """Handle assistant_thread_started / assistant_thread_context_changed:
+    record the user's currently-viewed channel (assistant_thread.context.channel_id)
+    against this assistant thread, and on the 'started' event also pin the
+    suggested prompts. Both events share the same assistant_thread payload
+    shape; only the trigger differs."""
+    at = ev.get("assistant_thread") or {}
+    channel = at.get("channel_id")
+    thread_ts = at.get("thread_ts")
+    ctx_channel = (at.get("context") or {}).get("channel_id")
+    key = thread_ts or channel
+    if key and ctx_channel:
+        _viewing_context[key] = ctx_channel
+        print(f"[slack] viewing-context: thread {key} -> channel {ctx_channel}", flush=True)
+    if ev.get("type") == "assistant_thread_started" and channel and thread_ts:
+        set_suggested_prompts(channel, thread_ts)
+
+
 def _progress_text(phase, thinking):
     """One status line for the live-thinking indicator: the emoji from `phase`
     (💭/🔧/✍️) plus the last line of `thinking`, truncated. Falls back to the
@@ -208,6 +316,97 @@ def _make_progress_cb(channel, ts):
         set_thinking(channel, ts, text, loading=[text])
 
     return _cb
+
+
+class _Streamer:
+    """Buffers on_text() answer-text fragments from run_claude() and flushes
+    them to Slack's chat.startStream/appendStream/stopStream, throttled to
+    roughly one call per SLACK_STREAM_MIN_INTERVAL (well under the Tier-4
+    100/min limit on appendStream). `markdown_text` on start/append/stop is
+    APPENDED to the message, not an overwrite — see the Oct 2025 streaming
+    changelog — so callers must only ever pass the new incremental fragment,
+    never the accumulated text.
+
+    Any Slack API error marks the stream `broken`; from that point on() is a
+    no-op and the caller (handle()) must fall back to post()-ing the full
+    reply so the user still gets a complete answer. `on_clear`, if given, is
+    invoked once on the first fragment (used to clear the live-thinking
+    indicator once the real answer starts appearing)."""
+
+    def __init__(self, channel, thread_ts, recipient_user_id, on_clear=None):
+        self.channel = channel
+        self.thread_ts = thread_ts
+        self.recipient_user_id = recipient_user_id
+        self.on_clear = on_clear
+        self.ts = None
+        self.buf = ""
+        self.broken = False
+        self.last_flush = 0.0
+        self.lock = threading.Lock()
+
+    def on_text(self, delta):
+        if self.broken or not delta:
+            return
+        if self.on_clear is not None:
+            cb, self.on_clear = self.on_clear, None
+            try:
+                cb()
+            except Exception:
+                pass
+        with self.lock:
+            self.buf += delta
+            now = time.monotonic()
+            due = (now - self.last_flush >= SLACK_STREAM_MIN_INTERVAL
+                   or len(self.buf) >= SLACK_STREAM_MIN_CHARS)
+            if not due:
+                return
+            text, self.buf = self.buf, ""
+            self.last_flush = now
+        self._send(text)
+
+    def _send(self, text):
+        try:
+            if self.ts is None:
+                kw = {"channel": self.channel, "markdown_text": text}
+                if self.thread_ts:
+                    kw["thread_ts"] = self.thread_ts
+                if TEAM_ID:
+                    kw["recipient_team_id"] = TEAM_ID
+                if self.recipient_user_id:
+                    kw["recipient_user_id"] = self.recipient_user_id
+                d = api("chat.startStream", **kw)
+                self.ts = d.get("ts")
+            elif text:
+                api("chat.appendStream", channel=self.channel, ts=self.ts, markdown_text=text)
+        except Exception as exc:
+            print(f"[slack] stream error in {self.channel}: {exc}", flush=True)
+            self.broken = True
+
+    def stop(self):
+        """Flush any remaining buffer and close the stream. Returns True if the
+        stream is now the system of record for the reply (caller must NOT also
+        post() the full text); False if it never started or broke along the
+        way — the caller must post() the full reply as usual."""
+        if self.broken or self.ts is None:
+            # Broken mid-stream, or never got a single fragment (empty/instant
+            # error reply) — nothing coherent to stop(); caller falls back.
+            if self.broken and self.ts is not None:
+                try:
+                    api("chat.stopStream", channel=self.channel, ts=self.ts)
+                except Exception:
+                    pass
+            return False
+        with self.lock:
+            text, self.buf = self.buf, ""
+        try:
+            kw = {"channel": self.channel, "ts": self.ts}
+            if text:
+                kw["markdown_text"] = text
+            api("chat.stopStream", **kw)
+            return True
+        except Exception as exc:
+            print(f"[slack] stopStream error in {self.channel}: {exc}", flush=True)
+            return False
 
 
 def download_images(ev):
@@ -378,7 +577,16 @@ def _threadmem_upsert(channel, session_thread, first_line):
 
 
 def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_dm, images=None,
-                       threadmem_content="", threadmem_path=None):
+                       threadmem_content="", threadmem_path=None, reply_thread_ts=None,
+                       viewing_channel=None):
+    progress_post_cmd = f"python /app/src/slack_api.py post {channel} \"...\""
+    worker_dispatch_hint = f"subagent.py claude <name> \"<brief>\" --channel <this channel> --report"
+    thread_note = ""
+    if reply_thread_ts:
+        progress_post_cmd += f" --thread {reply_thread_ts}"
+        worker_dispatch_hint += f" --thread {reply_thread_ts}"
+        thread_note = (f" (operating inside thread {reply_thread_ts} — any reply, progress "
+                       "post, or worker you dispatch must stay in this thread)")
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
         if history else ""
@@ -409,6 +617,14 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
             "directory layout, or absolute paths. If asked, briefly decline as "
             "something you don't do, and move on."
         )
+    if viewing_channel:
+        label = channel_name(viewing_channel)
+        label = f"#{label}" if label else viewing_channel
+        lines.append(
+            f"用户当前在 Slack 主界面里正看着频道 {label}(channel_id={viewing_channel})—— "
+            "这是 Slack 的 Assistant 面板上下文,仅供你判断他这句话可能指的是哪儿,不要"
+            "假设他一定是在问这个频道,该频道的具体消息内容你并没有(除非另有提供)。"
+        )
     lines.append(
         "Use the recent messages for context; act on the new Message. Your final "
         "answer IS delivered to this channel in full — long answers are split into "
@@ -417,17 +633,15 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
         "user. NEVER leave the substance only in local files or session memory — "
         "the user cannot see your machine, so 'full log in tmp/x.txt' delivers "
         "nothing; quote the relevant content itself. For longer work, post brief "
-        "progress updates as you go "
-        f"(`python /app/src/slack_api.py post {channel} \"...\"`) so nothing stays "
+        f"progress updates as you go (`{progress_post_cmd}`) so nothing stays "
         "invisible. You are the dispatcher, not the laborer: substantial work "
         "(builds, installs, pipelines, long jobs, real coding tasks) must be "
-        "handed to a tmux worker — subagent.py claude <name> \"<brief>\" "
-        "--channel <this channel> --report (see CLAUDE.md) — then supervised "
-        "across turns with list/logs and course-corrected with `steer <name> "
-        "\"...\"`; don't grind it inside this reply run. FIRST on every message run "
-        "`python /app/src/subagent.py list --channel <this channel>` to see tasks "
-        "already going here and route any follow-up to the right one (ask if "
-        "ambiguous). Do NOT put a status/done "
+        f"handed to a tmux worker — {worker_dispatch_hint} (see CLAUDE.md) — then "
+        "supervised across turns with list/logs and course-corrected with `steer "
+        "<name> \"...\"`; don't grind it inside this reply run. FIRST on every "
+        "message run `python /app/src/subagent.py list --channel <this channel>` "
+        "to see tasks already going here and route any follow-up to the right "
+        "one (ask if ambiguous). Do NOT put a status/done "
         "checkmark (✅) in your reply text — the reply itself is the completion "
         "signal on Slack. Keep the prose free of status emoji."
     )
@@ -448,7 +662,7 @@ def build_instruction(author, channel, prompt, history, crossctx, is_dm, owner_d
             + "\n".join(f"- {p}" for p in images) + "\n]"
         )
     return ("\n".join(lines)
-            + f"\n\nSender: {author}\nThis Slack channel: {channel}\n\n"
+            + f"\n\nSender: {author}\nThis Slack channel: {channel}{thread_note}\n\n"
             + f"{threadmem_content}{crossctx}{context_block}New Message:\n{prompt}{img_block}")
 
 
@@ -550,10 +764,13 @@ def drain_deferred_slack():
         crossctx = b.crossctx_block(person, "slack", channel)
         threadmem_content = _threadmem_read_block(channel) if SLACK_THREAD_SESSIONS else ""
         threadmem_path = _threadmem_path(channel) if SLACK_THREAD_SESSIONS else None
+        viewing_channel = _lookup_viewing_channel(channel, latest.get("thread_ts"))
         instruction = build_instruction(author, channel, catchup_text, history, crossctx,
                                          is_dm, owner_dm, images,
                                          threadmem_content=threadmem_content,
-                                         threadmem_path=threadmem_path)
+                                         threadmem_path=threadmem_path,
+                                         reply_thread_ts=reply_thread_ts,
+                                         viewing_channel=viewing_channel)
         try:
             with b.channel_lock(key):
                 reply = b.run_claude(author, key, catchup_text, guild_id="_slack",
@@ -621,6 +838,7 @@ def handle(ev, is_dm):
         return
     print(f"[slack] handling {ts} in {channel} from {author} ({len(images)} img)", flush=True)
     thinking_ts = (reply_thread_ts or ts) if SLACK_THREAD_SESSIONS else ts
+    _maybe_set_thread_title(channel, thinking_ts, text)
     if SLACK_LIVE_THINKING:
         # Pin a single steady "received, working" line from the very first
         # moment. Pass a one-element `loading` so this immediately overrides any
@@ -638,26 +856,46 @@ def handle(ev, is_dm):
     crossctx = b.crossctx_block(person, "slack", channel)
     threadmem_content = _threadmem_read_block(channel) if SLACK_THREAD_SESSIONS else ""
     threadmem_path = _threadmem_path(channel) if SLACK_THREAD_SESSIONS else None
+    viewing_channel = _lookup_viewing_channel(channel, thread_ts)
     instruction = build_instruction(author, channel, text, history, crossctx, is_dm, owner_dm, images,
-                                     threadmem_content=threadmem_content, threadmem_path=threadmem_path)
+                                     threadmem_content=threadmem_content, threadmem_path=threadmem_path,
+                                     reply_thread_ts=reply_thread_ts, viewing_channel=viewing_channel)
     progress_cb = _make_progress_cb(channel, thinking_ts) if SLACK_LIVE_THINKING else None
+    # SLACK_STREAMING: stream the answer text itself via chat.*Stream as it's
+    # generated, instead of posting the full reply once run_claude returns.
+    # Anchor the stream under the triggering message when we're not already
+    # replying in a thread (reply_thread_ts is None) — chat.startStream's
+    # thread_ts otherwise has nothing to attach to.
+    streamer = None
+    if SLACK_STREAMING:
+        stream_thread_ts = reply_thread_ts or ts
+        streamer = _Streamer(channel, stream_thread_ts, user,
+                              on_clear=lambda: set_thinking(channel, thinking_ts, ""))
     try:
         with b.channel_lock(key):
             reply = b.run_claude(author, key, text, guild_id="_slack",
                                  is_dm=is_dm, owner_dm=owner_dm, instruction=instruction,
-                                 on_progress=progress_cb)
+                                 on_progress=progress_cb,
+                                 on_text=streamer.on_text if streamer else None)
     except b.RateLimited as rl:
+        if streamer is not None:
+            streamer.stop()  # best-effort close of any partial stream
         defer_slack_message(channel, ts, thread_ts, user, author, person, text, is_dm, owner_dm, images)
         set_thinking(channel, thinking_ts, "")
         post(channel, f"⏳ Claude 额度刚好用满,约 {b.fmt_utc(rl.reset_epoch)} 恢复后我会自动回复你。", reply_thread_ts)
         return
     except Exception as exc:
+        if streamer is not None:
+            streamer.stop()
         print(f"[slack] handler error in {channel}: {exc}", flush=True)
         set_thinking(channel, thinking_ts, "")
         post(channel, f"⚠️ bridge error: {str(exc)[:300]}", reply_thread_ts)
         return
     set_thinking(channel, thinking_ts, "")  # clear before the reply lands (also auto-clears)
-    post(channel, reply, reply_thread_ts)
+    if streamer is None or not streamer.stop():
+        # No streaming, or the stream never started/broke mid-way — the user
+        # must still get the complete answer via the normal path.
+        post(channel, reply, reply_thread_ts)
     b.log_crossctx(person, "slack", channel, text, reply)
     if SLACK_THREAD_SESSIONS:
         _threadmem_upsert(channel, session_thread, text)
@@ -667,6 +905,12 @@ def on_event(ev):
     et = ev.get("type")
     print(f"[slack] event: {et} ch={ev.get('channel')} user={ev.get('user')} "
           f"subtype={ev.get('subtype')}", flush=True)
+    if et in ("assistant_thread_started", "assistant_thread_context_changed"):
+        # Different payload shape (no top-level channel/user/ts) — dispatch
+        # before the generic app_mention/message filtering below, which
+        # assumes those fields exist.
+        POOL.submit(on_assistant_thread_event, ev)
+        return
     subtype = ev.get("subtype")
     if ev.get("bot_id") or (subtype and subtype != "file_share"):
         return  # other bots, edits, joins, … — but keep file_share (image uploads)
@@ -709,8 +953,10 @@ async def session():
 
 
 async def main_async():
-    global SELF_ID
-    SELF_ID = api("auth.test")["user_id"]
+    global SELF_ID, TEAM_ID
+    auth = api("auth.test")
+    SELF_ID = auth["user_id"]
+    TEAM_ID = auth.get("team_id")
     print(f"[slack] starting (bot user {SELF_ID}, workers={WORKERS})", flush=True)
     while True:
         try:

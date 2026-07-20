@@ -1407,15 +1407,19 @@ class _Res:
         self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
 
 
-def _stream_claude(cmd, cwd, env, run_id, on_progress=None):
+def _stream_claude(cmd, cwd, env, run_id, on_progress=None, on_text=None):
     """Run claude with stream-json, writing live phase/thinking to the run's
     telemetry as events arrive. Returns a result whose stdout is the final
     `result` event (so the caller's json parsing is unchanged). Raises
     subprocess.TimeoutExpired on timeout, like subprocess.run did.
 
     on_progress(phase, thinking), if given, is called at the same points as the
-    telemetry write below. Any exception it raises is swallowed — a broken
-    callback must never take down the underlying claude run."""
+    telemetry write below. on_text(delta), if given, is called with each raw
+    answer-text fragment (text_delta) as it arrives — the incremental piece,
+    not the accumulated buffer — for callers that want to stream the reply
+    itself (e.g. Slack's chat.*Stream). Any exception either callback raises is
+    swallowed — a broken callback must never take down the underlying claude
+    run."""
     proc = subprocess.Popen(
         cmd, cwd=cwd, env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1,
@@ -1452,8 +1456,14 @@ def _stream_claude(cmd, cwd, env, run_id, on_progress=None):
                     think += d.get("thinking", "")
                     phase = "💭 thinking"
                 elif d.get("type") == "text_delta":
-                    think += d.get("text", "")
+                    delta = d.get("text", "")
+                    think += delta
                     phase = "✍️ replying"
+                    if on_text is not None and delta:
+                        try:
+                            on_text(delta)
+                        except Exception:
+                            pass
             elif t == "assistant":
                 for blk in (ev.get("message") or {}).get("content") or []:
                     bt = blk.get("type")
@@ -1493,7 +1503,8 @@ def _stream_claude(cmd, cwd, env, run_id, on_progress=None):
 
 
 def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=False,
-               owner_dm=False, extra_context="", instruction=None, on_progress=None):
+               owner_dm=False, extra_context="", instruction=None, on_progress=None,
+               on_text=None):
     context_block = (
         f"Recent channel messages (oldest first, for context only):\n{history}\n\n"
         if history
@@ -1591,7 +1602,8 @@ def run_claude(author, channel_id, prompt, history="", guild_id=None, is_dm=Fals
             cmd.extend(["--resume", resume_id])
         cmd.append(instruction)
         if STREAM_TELEMETRY:
-            return _stream_claude(cmd, server_dir, sub_env, run_id, on_progress=on_progress)
+            return _stream_claude(cmd, server_dir, sub_env, run_id, on_progress=on_progress,
+                                   on_text=on_text)
         return subprocess.run(
             cmd, cwd=server_dir, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, timeout=TIMEOUT_SECONDS, env=sub_env,

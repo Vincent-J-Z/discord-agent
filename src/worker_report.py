@@ -36,9 +36,15 @@ REPORT_BACKSTOP_AGE = int(os.environ.get("REPORT_BACKSTOP_AGE", "600"))
 
 def _instruction(rep):
     channel = str(rep.get("channel"))
+    thread = str(rep.get("thread") or "")
     slack = not channel.isdigit()
     toolbox = "slack_api.py" if slack else "discord_api.py"
     plat = "Slack" if slack else "Discord"
+    post_cmd = f"python /app/src/{toolbox} post {channel} \"<your message>\""
+    thread_note = ""
+    if slack and thread:
+        post_cmd += f" --thread {thread}"
+        thread_note = f" This reply must stay INSIDE thread {thread} — do not post top-level."
     return (
         f"You are {b.AGENT_NAME}. Earlier you dispatched a background worker to do "
         "a task and told the user you'd report back. The worker has now FINISHED "
@@ -46,9 +52,9 @@ def _instruction(rep):
         "voice — do not paste the raw log; digest it and tell them what they need: "
         "the outcome/result, whether it succeeded (exit code), anything notable, "
         "and any decision now needed from them. Be concise and natural, as a "
-        "continuation of your earlier conversation.\n"
+        f"continuation of your earlier conversation.{thread_note}\n"
         f"Post your message to {plat} channel {channel} with:\n"
-        f"    python /app/src/{toolbox} post {channel} \"<your message>\"\n"
+        f"    {post_cmd}\n"
         "Post exactly once. Your stdout is only logged.\n\n"
         f"Worker task: {rep.get('note') or '(no note)'}\n"
         f"Worker name: {rep.get('name')}\n"
@@ -59,10 +65,18 @@ def _instruction(rep):
 
 def narrate(rep):
     channel = str(rep.get("channel"))
+    thread = str(rep.get("thread") or "")
+    slack = not channel.isdigit()
     # Continue the dispatcher's own conversation for this channel where possible:
-    # Slack sessions are keyed "slack:<ch>", Discord by the channel id.
-    session_key = f"slack:{channel}" if not channel.isdigit() else channel
-    guild_id = "_slack" if not channel.isdigit() else (b.CHANNEL_GUILD.get(channel) or "_report")
+    # Slack sessions are keyed "slack:<ch>", or "slack:<ch>:<thread>" when the
+    # worker was dispatched inside a thread-session; Discord by the channel id.
+    if slack and thread:
+        session_key = f"slack:{channel}:{thread}"
+    elif slack:
+        session_key = f"slack:{channel}"
+    else:
+        session_key = channel
+    guild_id = "_slack" if slack else (b.CHANNEL_GUILD.get(channel) or "_report")
     server_dir = b.ensure_server_dir(guild_id)
     session_id = b.get_session(session_key)
     env = dict(os.environ,
@@ -121,6 +135,7 @@ def backstop_post(rep):
     narrate() has repeatedly failed or the report is too stale — the user
     should get SOMETHING rather than a silently dropped result."""
     channel = str(rep.get("channel"))
+    thread = str(rep.get("thread") or "")
     slack = not channel.isdigit()
     script = os.path.join(ROOT, "slack_api.py" if slack else "discord_api.py")
     result = (rep.get("result") or "(empty)").strip()
@@ -128,9 +143,11 @@ def backstop_post(rep):
         result = result[:1500] + "…"
     msg = (f"⚠️ worker {rep.get('name')} 已完成(exit {rep.get('exit')}),"
            f"但我没能正常汇报,先把原始结果直发给你:\n{result}")
+    argv = [sys.executable, script, "post", channel, msg]
+    if slack and thread:
+        argv += ["--thread", thread]
     try:
-        r = subprocess.run([sys.executable, script, "post", channel, msg],
-                            cwd=ROOT, text=True, capture_output=True, timeout=60)
+        r = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, timeout=60)
     except Exception as exc:
         print(f"[report] backstop post errored for '{rep.get('name')}': {exc}", flush=True)
         return False
