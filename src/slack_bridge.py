@@ -213,6 +213,12 @@ def set_thinking(channel, thread_ts, text="", loading=None):
         # An empty status string CLEARS the indicator (per Slack docs), so when
         # we mean "show thinking" the status must be non-empty even if loading
         # messages are supplied — otherwise nothing renders at all.
+        # Slack hard limit: each loading_messages item must be 1..50 chars
+        # (longer -> invalid_arguments and NOTHING renders), so clamp here at
+        # the single choke point rather than in every caller; status itself
+        # tolerates longer text.
+        if loading:
+            loading = [m[:50] for m in loading if m]
         if loading and not text:
             text = loading[0]
         kw = {"channel_id": channel, "thread_ts": thread_ts, "status": text}
