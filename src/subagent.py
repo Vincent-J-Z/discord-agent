@@ -157,6 +157,10 @@ def _write_runner(command, name, channel, report, claude_json=False, note="", th
     lines = [
         "#!/bin/bash",
         f"set -a; [ -f {shlex.quote(runenv)} ] && . {shlex.quote(runenv)}; set +a",
+        # Tell the worker its OWN task name, so `subagent.py list` can flag its own
+        # row. Without this a worker sees its just-registered entry, mistakes it
+        # for a pre-existing duplicate, and self-exits without doing the work.
+        f"export SUBAGENT_SELF={shlex.quote(name)}",
         f"({command}) > {shlex.quote(log)} 2>&1",
         f"echo $? > {shlex.quote(done)}",
     ]
@@ -329,6 +333,7 @@ def cmd_list(a):
     to the current conversation; finished tasks drop off after DONE_RETENTION."""
     _ensure_dirs()
     chan = getattr(a, "channel", None)
+    self_name = os.environ.get("SUBAGENT_SELF")  # set when a worker calls this
     now = time.time()
     names = sorted(f[:-5] for f in os.listdir(STATE_DIR) if f.endswith(".json"))
     rows = []
@@ -353,9 +358,13 @@ def cmd_list(a):
     if not rows:
         print("(no active tasks in this conversation)")
         return 0
+    if self_name and any(r[0] == self_name for r in rows):
+        print(f"NOTE: '{self_name}' below is YOUR OWN task — you are running it right "
+              f"now. It is NOT a pre-existing duplicate; do the work, don't self-exit.")
     print(f"{'TASK':22} {'STATE':16} {'AGE':8} {'STEER':6} DESCRIPTION")
     for name, state, age, steer, desc in rows:
-        print(f"{name:22} {state:16} {age:8} {steer:6} {desc[:80]}")
+        marker = "   \u25c0 YOU" if name == self_name else ""
+        print(f"{name:22} {state:16} {age:8} {steer:6} {desc[:72]}{marker}")
     return 0
 
 
